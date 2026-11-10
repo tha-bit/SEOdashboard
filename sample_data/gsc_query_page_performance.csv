@@ -1,0 +1,4 @@
+Query,Page,Clicks,Impressions,CTR,Average Position,Search Type,Country,Device,Start Date,End Date
+running shoes,https://shop.example.com/shoes,40,1000,4%,8.2,web,GBR,Desktop,2026-10-01,2026-10-31
+running shoes,https://shop.example.com/sale-shoes,12,420,2.86%,13.1,web,GBR,Mobile,2026-10-01,2026-10-31
+trail shoes,https://shop.example.com/trail-shoes,18,510,3.53%,21.4,web,GBR,Desktop,2026-10-01,2026-10-31

@@ -1,0 +1,12 @@
+node_modules/
+frontend/dist/
+frontend/.vite/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.tsbuildinfo
+data/*.db
+data/*.db-*
+backups/*.db
+.DS_Store

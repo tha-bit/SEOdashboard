@@ -1,0 +1,5 @@
+From,Hreflang,To
+https://shop.example.com/category,en-GB,https://shop.example.com/category
+https://shop.example.com/category,fr-FR,https://shop.example.com/fr/category
+https://shop.example.com/fr/category,fr-FR,https://shop.example.com/fr/category
+https://shop.example.com/fr/category,en-GB,https://shop.example.com/category

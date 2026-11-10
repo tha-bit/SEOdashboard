@@ -1,0 +1,10 @@
+Address,Content Type,Status Code,Status,Indexability,Indexability Status,URL Path,Page Type,Title 1,Meta Description 1
+https://shop.example.com/,text/html; charset=utf-8,200,OK,Indexable,,/,Homepage,Example Shop,Shop the range
+https://shop.example.com/category/shoes/,text/html; charset=utf-8,200,OK,Indexable,,/category/shoes/,PLP,Shoes,All shoes
+https://shop.example.com/category/shoes/?utm_source=newsletter,text/html; charset=utf-8,200,OK,Indexable,,/category/shoes/,PLP,Shoes,Tracked duplicate
+https://shop.example.com/product/red-trainer,text/html; charset=utf-8,200,OK,Indexable,,/product/red-trainer,PDP,Red Trainer,Product description
+https://shop.example.com/product/Blue-Trainer,text/html; charset=utf-8,200,OK,Indexable,,/product/Blue-Trainer,PDP,Blue Trainer,Case-sensitive path
+https://shop.example.com/product/blue-trainer,text/html; charset=utf-8,404,Not Found,Non-Indexable,Client Error,/product/blue-trainer,PDP,Missing trainer,Not found
+https://shop.example.com/blog/shoe-care,text/html; charset=utf-8,200,OK,Indexable,,/blog/shoe-care,Editorial,Shoe care,Editorial guide
+https://shop.example.com/old-sale,text/html; charset=utf-8,301,Moved Permanently,Non-Indexable,Redirected,/old-sale,,Old sale,Redirecting
+not-a-url,text/html; charset=utf-8,200,OK,Indexable,,/bad,,Bad row,Invalid URL fixture

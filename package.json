@@ -1,0 +1,14 @@
+{
+  "name": "seo-data-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "concurrently -n api,web -c green,blue \"python3 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload\" \"npm --prefix frontend run dev\"",
+    "test": "python3 -m pytest -q",
+    "build": "npm --prefix frontend run build",
+    "install:all": "python3 -m pip install -r requirements.txt && npm --prefix frontend install"
+  },
+  "devDependencies": {
+    "concurrently": "9.2.5"
+  }
+}

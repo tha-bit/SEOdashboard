@@ -1,0 +1,5 @@
+Keyword,Volume,KD %,Position,Intent,URL,SERP Features,Database,Device,Date
+running shoes,12000,62,7,Commercial,https://shop.example.com/shoes,"Sitelinks, Images",UK,Desktop,2026-10-01
+running shoes,12000,62,12,Commercial,https://shop.example.com/sale-shoes,Sitelinks,UK,Desktop,2026-10-01
+trail shoes,4800,48,22,Transactional,https://shop.example.com/trail-shoes,Images,UK,Mobile,2026-10-01
+shoe care,900,35,41,Informational,,People also ask,UK,Desktop,2026-10-01
