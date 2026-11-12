@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DATABASE_URL = os.getenv("SEO_DATABASE_URL", f"sqlite:///{DATA_DIR / 'seo_workspace.db'}")
+from .paths import DATA_DIR
+
+
+DATABASE_PATH = DATA_DIR / "seo_workspace.db"
+DATABASE_URL = os.getenv("SEO_DATABASE_URL", f"sqlite:///{DATABASE_PATH.as_posix()}")
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
@@ -26,4 +26,3 @@ def get_db():
         yield db
     finally:
         db.close()
-

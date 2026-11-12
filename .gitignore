@@ -9,4 +9,7 @@ __pycache__/
 data/*.db
 data/*.db-*
 backups/*.db
+build/offline-release/
+release-assets/
+*.spec
 .DS_Store

@@ -9,13 +9,17 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from .database import Base, DATA_DIR, DATABASE_URL, engine, get_db
+from .database import DATABASE_URL, get_db
+from .migrations import run_startup_migrations
+from .paths import BACKUP_DIR, STATIC_DIR, is_packaged
+from .runtime_control import request_shutdown, runtime_enabled
 from .models import CannibalizationCase, GA4PagePerformance, GSCQueryPagePerformance, ImportBatch, ImportRow, IssueSolution, KeywordGroup, KeywordGroupMembership, Page, PageCrawlChange, PageMetadataRecommendation, PageType, Project, RankingObservation, SitemapEntry, TargetMapping
 from .schemas import BulkTypeUpdate, ConfirmImport, ImportOut, IssueSolutionCreate, ManualPageCreate, PageOut, ProjectCreate, ProjectOut, ProjectUpdate
 from .services.imports import confirm_import, stage_upload
@@ -34,7 +38,8 @@ from .services.keywords import confirm_keyword_import, current_keyword_rows
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    if get_db not in app.dependency_overrides:
+        run_startup_migrations()
     yield
 
 
@@ -63,7 +68,19 @@ def batch_or_404(db: Session, batch_id: str) -> ImportBatch:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "storage": "sqlite"}
+    return {"status": "ok", "storage": "sqlite", "packaged": is_packaged()}
+
+
+@app.get("/api/runtime/status")
+def runtime_status():
+    return {"local_runtime": runtime_enabled()}
+
+
+@app.post("/api/runtime/shutdown")
+def runtime_shutdown(x_seo_shutdown_token: str | None = Header(default=None)):
+    if not x_seo_shutdown_token or not request_shutdown(x_seo_shutdown_token):
+        raise HTTPException(404, "Local runtime control is not available")
+    return {"status": "stopping"}
 
 
 def on_page_issue_category(issue_type: str) -> str:
@@ -596,9 +613,27 @@ def backup_database():
     if not DATABASE_URL.startswith("sqlite:///"):
         raise HTTPException(501, "Backup download is available only for SQLite")
     source_path = Path(DATABASE_URL.removeprefix("sqlite:///"))
-    backup_dir = DATA_DIR.parent / "backups"
-    backup_dir.mkdir(exist_ok=True)
-    backup_path = backup_dir / "seo_workspace_backup.db"
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    backup_path = BACKUP_DIR / "seo_workspace_backup.db"
     with sqlite3.connect(source_path) as source, sqlite3.connect(backup_path) as target:
         source.backup(target)
     return FileResponse(backup_path, filename="seo_workspace_backup.db", media_type="application/vnd.sqlite3")
+
+
+if STATIC_DIR.is_dir() and (STATIC_DIR / "index.html").is_file():
+    assets = STATIC_DIR / "assets"
+    if assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets), name="frontend-assets")
+
+    @app.get("/{frontend_path:path}", include_in_schema=False)
+    def frontend_app(frontend_path: str):
+        if frontend_path == "api" or frontend_path.startswith("api/"):
+            raise HTTPException(404, "API route not found")
+        requested = (STATIC_DIR / frontend_path).resolve()
+        try:
+            requested.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            raise HTTPException(404, "File not found")
+        if requested.is_file():
+            return FileResponse(requested)
+        return FileResponse(STATIC_DIR / "index.html")

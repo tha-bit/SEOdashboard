@@ -1,0 +1,3 @@
+#!/bin/sh
+APP_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../../../" && pwd)"
+exec "$APP_ROOT/SEO Dashboard.app/Contents/MacOS/SEO Dashboard" --stop

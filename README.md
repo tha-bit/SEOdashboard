@@ -2,7 +2,41 @@
 
 A local-first ecommerce SEO inventory, architecture, on-page, keyword-research and keyword-mapping application. It retains imported evidence and review decisions separately, from staged Screaming Frog/Semrush/GSC/GA4 files through approved target pages and cannibalization decisions. No crawler, AI service, account, cloud backend, live SEO-provider connection, or automatic website deployment is included.
 
-## Run locally
+## Download and use offline
+
+Download the package for your computer from the repository's **Releases** page and extract the complete ZIP. Python, Node.js, a database server, and an internet connection are not required.
+
+### Windows
+
+1. Extract `SEO-Data-Workspace-Windows-x64.zip`.
+2. Double-click **SEO Dashboard.exe**. The dashboard opens in the default browser.
+3. Double-click **Stop SEO Dashboard.exe** when finished.
+
+### macOS
+
+Choose the Apple Silicon package for M-series Macs or the Intel package for older Macs.
+
+1. Extract the downloaded ZIP.
+2. Double-click **SEO Dashboard.app**. The dashboard opens in the default browser.
+3. Double-click **Stop SEO Dashboard.app** when finished.
+
+The packaged server listens only on `127.0.0.1:8765`, is not exposed to the local network, and serves both the dashboard and API from the downloaded application. The stable local address also preserves browser-saved table layouts and display preferences across application updates. All core workflows operate on local files and SQLite; no cloud service is required.
+
+### Data and updates
+
+Application files and user data are deliberately separate:
+
+- Windows: `%LOCALAPPDATA%\SEO Data Workspace\seo_workspace.db`
+- macOS: `~/Library/Application Support/SEO Data Workspace/seo_workspace.db`
+- Developer checkout: `data/seo_workspace.db`
+
+To update, stop the current version, download and extract the new release, and launch it. The new version reuses the database in the user-data folder. Before a schema migration, the application creates a timestamped SQLite backup under the user-data `backups` folder. It never stores the live database inside the replaceable release folder.
+
+Use **Settings → Download backup** before major updates or when moving to another computer. Project bundle downloads remain available for moving individual projects.
+
+> macOS and Windows may warn about unsigned applications. For warning-free double-click releases, configure the signing secrets described under “Automated GitHub releases”. Unsigned macOS test builds may require Control-click → Open once.
+
+## Developer setup
 
 Requirements: Python 3.11+ and Node.js 20+.
 
@@ -46,11 +80,52 @@ python -m pytest -q
 npm run build
 ```
 
+The production frontend is served by FastAPI from `frontend/dist`. To exercise the same local production runtime without creating an operating-system package:
+
+```bash
+source .venv/bin/activate
+npm run build
+python -m backend.launcher
+```
+
+Stop it with:
+
+```bash
+python -m backend.launcher --stop
+```
+
+## Automated GitHub releases
+
+The application has one codebase. `.github/workflows/ci.yml` builds and tests pushes and pull requests. `.github/workflows/release.yml` uses the tagged source to:
+
+1. Run the Python test suite and production frontend build.
+2. Build self-contained Windows x64, macOS Apple Silicon, and macOS Intel packages.
+3. Smoke-test the packaged local server, browser entry point, health endpoint, persistent data directory, and stop command.
+4. Create or update the matching GitHub Release and upload all ZIP packages.
+
+Publish a version by pushing a tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The release workflow can also be run manually from **Actions → Build offline release**, supplying a version tag. A normal source push does not publish a download; a version tag or manual release run does.
+
+### Optional signing secrets
+
+The builds work without signing, but operating systems may show security warnings. Configure these GitHub Actions repository secrets for normal double-click distribution:
+
+- Windows: `WINDOWS_CERTIFICATE_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`
+- macOS: `APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`
+
+The macOS workflow signs both apps, submits the package to Apple's notary service, and staples the result when all Apple secrets are present. Signing credentials are never stored in the repository or release package.
+
 Use `sample_data/screaming_frog_inventory.csv` to exercise duplicates, invalid URLs, path-case variants, redirects, 404s, non-indexable pages and classification values. Use `sample_data/screaming_frog_on_page.csv` and `sample_data/screaming_frog_hreflang.csv` to exercise current metadata, explicit empty values, multiple H1s, and separate repeated-row hreflang evidence. Phase 4 fixtures are `semrush_keyword_positions.csv`, `gsc_query_only.csv`, `gsc_query_page_performance.csv`, and `ga4_landing_pages.csv`.
 
 ## Database and migrations
 
-SQLite data is stored at `data/seo_workspace.db`. The API creates a new database on first launch. The matching Alembic foundation migration is included:
+In a developer checkout, SQLite data is stored at `data/seo_workspace.db`; packaged locations are listed above. The API creates a new database on first launch and automatically applies Alembic migrations. Before upgrading an existing packaged database, it creates a local safety backup. Developers can also run migrations explicitly:
 
 ```bash
 alembic upgrade head
