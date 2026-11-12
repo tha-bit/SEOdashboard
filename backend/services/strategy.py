@@ -24,8 +24,9 @@ from ..models import (
     ReviewHistory,
     TargetMapping,
 )
-from .keywords import current_keyword_rows
+from .keywords import current_keyword_rows, split_intents
 from .on_page import latest_metadata
+from .drafts import materialize_legacy_draft_targets
 
 
 SYNONYMS = {"ladies": "women", "womens": "women", "woman": "women", "mens": "men", "man": "men", "trainers": "shoes", "trainer": "shoes"}
@@ -52,7 +53,8 @@ def grouping_key(keyword: Keyword, intent: str | None) -> tuple[str, list[str], 
     informational = any(token in INFO_MODIFIERS for token in tokens)
     commercial = any(token in COMMERCIAL_MODIFIERS for token in tokens)
     base = [token for token in tokens if token not in INFO_MODIFIERS | COMMERCIAL_MODIFIERS]
-    family = "informational" if informational else "commercial" if commercial else (intent or "mixed").casefold()
+    imported_intents = {item.casefold() for item in split_intents(intent)}
+    family = "informational" if informational else "commercial" if commercial else "commercial" if imported_intents & {"commercial", "transactional"} else "informational" if "informational" in imported_intents else next(iter(imported_intents), "mixed")
     intent_family = "informational" if family == "informational" else "commercial" if family in {"commercial", "transactional"} else family
     reasons = ["normalized_tokens", "singular_plural_normalized"]
     if any(token in SYNONYMS for token in re.findall(r"[a-z0-9]+", keyword.text.casefold())):
@@ -117,22 +119,29 @@ def generate_strategy_suggestions(db: Session, project: Project) -> dict[str, in
             if not membership:
                 db.add(KeywordGroupMembership(project_id=project.id, group_id=group.id, keyword_id=keyword.id, role="primary" if keyword.id == primary.id else "supporting", status="suggested", source="rule_based", reason_codes=reasons))
                 memberships += 1
+    db.flush()
+    memberships_by_group: dict[str, list[KeywordGroupMembership]] = defaultdict(list)
+    for membership in db.scalars(select(KeywordGroupMembership).where(KeywordGroupMembership.project_id == project.id)).all():
+        memberships_by_group[membership.group_id].append(membership)
+    active_groups = db.scalars(select(KeywordGroup).where(KeywordGroup.project_id == project.id, KeywordGroup.archived.is_(False))).all()
+    for group in active_groups:
         mapping = db.scalar(select(TargetMapping).where(TargetMapping.project_id == project.id, TargetMapping.group_id == group.id))
         if mapping and mapping.status == "approved":
             continue
         candidate_scores: dict[str, dict[str, Any]] = {}
-        for keyword, _, _ in items:
-            for observation in rankings.get(keyword.id, []):
+        for membership in memberships_by_group.get(group.id, []):
+            for observation in rankings.get(membership.keyword_id, []):
                 url = observation.ranking_url
                 if not url:
                     continue
                 candidate = candidate_scores.setdefault(url, {"score": 0.0, "page_id": observation.page_id, "positions": [], "keywords": set()})
                 candidate["score"] += 50 + max(0, 50 - float(observation.position or 50))
                 candidate["positions"].append(observation.position)
-                candidate["keywords"].add(keyword.id)
+                candidate["keywords"].add(membership.keyword_id)
         if candidate_scores:
             best_url, best = max(candidate_scores.items(), key=lambda pair: (len(pair[1]["keywords"]), pair[1]["score"]))
-            confidence = "strong" if len(best["keywords"]) >= max(2, len(items) // 2) else "moderate" if best["page_id"] else "weak"
+            member_count = len(memberships_by_group.get(group.id, []))
+            confidence = "strong" if len(best["keywords"]) >= max(2, member_count // 2) else "moderate" if best["page_id"] else "weak"
             reason_codes = ["observed_semrush_ranking_url", "best_group_position"]
             if len(best["keywords"]) > 1:
                 reason_codes.append("shared_observed_url")
@@ -152,6 +161,8 @@ def generate_strategy_suggestions(db: Session, project: Project) -> dict[str, in
 
 
 def serialize_groups(db: Session, project: Project) -> list[dict[str, Any]]:
+    if materialize_legacy_draft_targets(db, project):
+        db.commit()
     rows = {row["id"]: row for row in current_keyword_rows(db, project)}
     groups = db.scalars(select(KeywordGroup).where(KeywordGroup.project_id == project.id).order_by(KeywordGroup.archived, KeywordGroup.name)).all()
     memberships = db.scalars(select(KeywordGroupMembership).where(KeywordGroupMembership.project_id == project.id)).all()
@@ -242,9 +253,23 @@ def scan_cannibalization(db: Session, project: Project) -> dict[str, int]:
         for member in group["members"]:
             for observation in _latest_rankings(db, project.id).get(member["id"], []):
                 if observation.ranking_url and observation.ranking_url != target["url"]:
-                    mismatches.append({"keyword": member["keyword"], "keyword_id": member["id"], "ranking_url": observation.ranking_url, "position": observation.position, "observed_on": observation.observed_on.isoformat() if observation.observed_on else None, "provider": observation.provider})
+                    mismatches.append({"keyword": member["keyword"], "keyword_id": member["id"], "ranking_url": observation.ranking_url, "position": observation.position, "page_id": observation.page_id, "page_type": pages[observation.page_id].page_type if observation.page_id in pages else None, "observed_on": observation.observed_on.isoformat() if observation.observed_on else None, "provider": observation.provider})
         if mismatches:
             _, was_created = _upsert_case(db, project.id, case_key=f"target_mismatch:{group['id']}", case_type="ranking_target_mismatch", group_id=group["id"], title=f"Observed rankings differ from approved target for {group['name']}", priority="review", evidence={"reason_codes": ["ranking_url_differs_from_approved_target"], "approved_target": target, "mismatches": mismatches}, unknowns=["A mismatch alone does not demonstrate traffic loss or harmful cannibalization."])
             created += int(was_created); updated += int(not was_created)
+    mapped_targets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for group in groups:
+        target = group.get("target")
+        if not target or target.get("status") != "approved" or not target.get("url"):
+            continue
+        for member in group.get("members", []):
+            mapped_targets[member["id"]].append({"url": target["url"], "page_id": target.get("page_id"), "page_type": target.get("page_type"), "group_id": group["id"], "group": group["name"], "approved_target": True})
+    for keyword_id, targets in mapped_targets.items():
+        unique_targets = {target["url"] for target in targets}
+        if len(unique_targets) <= 1:
+            continue
+        keyword = keywords.get(keyword_id)
+        _, was_created = _upsert_case(db, project.id, case_key=f"approved_keyword_multi_target:{keyword_id}", case_type="approved_keyword_multi_target", keyword_id=keyword_id, title=f"Multiple approved targets for {keyword.text if keyword else 'keyword'}", priority="review", evidence={"reason_codes": ["same_keyword_multiple_approved_targets"], "targets": targets}, unknowns=["Multiple approved mappings indicate keyword overlap, but do not prove that the pages compete in search results."])
+        created += int(was_created); updated += int(not was_created)
     db.commit()
     return {"created": created, "updated": updated, "active_signals": created + updated}

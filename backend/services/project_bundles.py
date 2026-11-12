@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..models import (
     AuditCase,
+    ActivityCategory,
     CannibalizationCase,
     CannibalizationEvidence,
     CaseDecision,
@@ -17,6 +18,8 @@ from ..models import (
     ImportBatch,
     ImportRow,
     IssueSolution,
+    IssueSnapshot,
+    IssueSnapshotRun,
     Keyword,
     KeywordGroup,
     KeywordGroupMembership,
@@ -30,11 +33,13 @@ from ..models import (
     Project,
     RankingObservation,
     ReviewHistory,
+    SEOActivity,
     GroupingSuggestion,
     SitemapDocument,
     SitemapEntry,
     TargetMapping,
     TopicCluster,
+    uid,
 )
 
 BUNDLE_FORMAT = "seo-data-workspace-project"
@@ -75,6 +80,10 @@ def export_project_bundle(db: Session, project: Project) -> dict[str, Any]:
     cannibalization_evidence = db.scalars(select(CannibalizationEvidence).where(CannibalizationEvidence.project_id == project.id)).all()
     case_decisions = db.scalars(select(CaseDecision).where(CaseDecision.project_id == project.id)).all()
     review_history = db.scalars(select(ReviewHistory).where(ReviewHistory.project_id == project.id)).all()
+    activity_categories = db.scalars(select(ActivityCategory).where(ActivityCategory.project_id == project.id).order_by(ActivityCategory.created_at)).all()
+    issue_snapshots = db.scalars(select(IssueSnapshot).where(IssueSnapshot.project_id == project.id).order_by(IssueSnapshot.observed_at)).all()
+    issue_snapshot_runs = db.scalars(select(IssueSnapshotRun).where(IssueSnapshotRun.project_id == project.id).order_by(IssueSnapshotRun.observed_at)).all()
+    seo_activities = db.scalars(select(SEOActivity).where(SEOActivity.project_id == project.id).order_by(SEOActivity.occurred_at)).all()
     return {
         "format": BUNDLE_FORMAT,
         "version": BUNDLE_VERSION,
@@ -229,6 +238,10 @@ def export_project_bundle(db: Session, project: Project) -> dict[str, Any]:
         "cannibalization_evidence": [{"source_id": item.id, "case_source_id": item.case_id, "evidence_type": item.evidence_type, "source": item.source, "observed_on": _iso(item.observed_on), "data": item.data, "created_at": _iso(item.created_at)} for item in cannibalization_evidence],
         "case_decisions": [{"source_id": item.id, "case_source_id": item.case_id, "status": item.status, "action": item.action, "preferred_page_source_id": item.preferred_page_id, "preferred_url": item.preferred_url, "reviewer": item.reviewer, "notes": item.notes, "decided_at": _iso(item.decided_at)} for item in case_decisions],
         "review_history": [{"source_id": item.id, "entity_type": item.entity_type, "entity_source_id": item.entity_id, "action": item.action, "reviewer": item.reviewer, "before_data": item.before_data, "after_data": item.after_data, "reason": item.reason, "created_at": _iso(item.created_at)} for item in review_history],
+        "activity_categories": [{"source_id": item.id, "name": item.name, "color": item.color, "created_at": _iso(item.created_at)} for item in activity_categories],
+        "issue_snapshots": [{"source_id": item.id, "batch_source_id": item.import_batch_id, "page_source_id": item.page_id, "issue_key": item.issue_key, "issue_source": item.issue_source, "issue_type": item.issue_type, "category": item.category, "severity": item.severity, "label": item.label, "url": item.url, "detail": item.detail, "evidence": item.evidence, "observed_on": _iso(item.observed_on), "observed_at": _iso(item.observed_at)} for item in issue_snapshots],
+        "issue_snapshot_runs": [{"source_id": item.id, "batch_source_id": item.import_batch_id, "observed_on": _iso(item.observed_on), "observed_at": _iso(item.observed_at), "outstanding_count": item.outstanding_count, "new_count": item.new_count, "resolved_count": item.resolved_count, "baseline": item.baseline} for item in issue_snapshot_runs],
+        "seo_activities": [{"source_id": item.id, "category_source_id": item.category_id, "page_source_id": item.page_id, "batch_source_id": item.import_batch_id, "recommendation_source_id": item.recommendation_id, "solution_source_id": item.issue_solution_id, "related_activity_source_id": item.related_activity_id, "event_key": item.event_key, "source": item.source, "section": item.section, "action_type": item.action_type, "status": item.status, "title": item.title, "notes": item.notes, "url": item.url, "issue_key": item.issue_key, "issue_type": item.issue_type, "before_data": item.before_data, "after_data": item.after_data, "activity_metadata": item.activity_metadata, "occurred_at": _iso(item.occurred_at), "created_at": _iso(item.created_at)} for item in seo_activities],
     }
 
 
@@ -256,7 +269,7 @@ def import_project_bundle(db: Session, bundle: dict[str, Any]) -> Project:
     source_project = bundle.get("project")
     if not isinstance(source_project, dict) or not source_project.get("name") or not source_project.get("site_url"):
         raise HTTPException(422, "Project bundle is missing required project details")
-    collection_names = ("pages", "import_batches", "import_rows", "page_crawl_changes", "page_relationships", "sitemap_documents", "sitemap_entries", "page_metadata_observations", "page_metadata_recommendations", "page_metadata_changes", "on_page_audit_cases", "issue_solutions", "keywords", "keyword_metrics_snapshots", "ranking_observations", "gsc_query_page_performance", "ga4_page_performance", "topic_clusters", "keyword_groups", "keyword_group_memberships", "grouping_suggestions", "target_mappings", "cannibalization_cases", "cannibalization_evidence", "case_decisions", "review_history")
+    collection_names = ("pages", "import_batches", "import_rows", "page_crawl_changes", "page_relationships", "sitemap_documents", "sitemap_entries", "page_metadata_observations", "page_metadata_recommendations", "page_metadata_changes", "on_page_audit_cases", "issue_solutions", "keywords", "keyword_metrics_snapshots", "ranking_observations", "gsc_query_page_performance", "ga4_page_performance", "topic_clusters", "keyword_groups", "keyword_group_memberships", "grouping_suggestions", "target_mappings", "cannibalization_cases", "cannibalization_evidence", "case_decisions", "review_history", "activity_categories", "issue_snapshots", "issue_snapshot_runs", "seo_activities")
     if any(not isinstance(bundle.get(name, []), list) for name in collection_names):
         raise HTTPException(422, "Project bundle contains invalid record collections")
     try:
@@ -438,6 +451,7 @@ def import_project_bundle(db: Session, bundle: dict[str, Any]) -> Project:
             if old_page_id and page_id:
                 issue_key = issue_key.replace(f":{old_page_id}", f":{page_id}", 1)
             db.add(AuditCase(project_id=project.id, page_id=page_id, issue_key=issue_key or None, case_type="on_page_issue", status=str(item.get("status") or "open"), reason=item.get("reason"), updated_at=_datetime(item.get("updated_at")) or datetime.now().astimezone(), evidence=item.get("evidence") or {}))
+        solution_ids: dict[str, str] = {}
         for item in bundle.get("issue_solutions", []):
             old_page_id = str(item.get("page_source_id")) if item.get("page_source_id") else None
             page_id = page_ids.get(old_page_id) if old_page_id else None
@@ -446,7 +460,7 @@ def import_project_bundle(db: Session, bundle: dict[str, Any]) -> Project:
             issue_key = str(item.get("issue_key") or "")
             if old_page_id and page_id:
                 issue_key = issue_key.replace(f":{old_page_id}", f":{page_id}", 1)
-            db.add(IssueSolution(
+            solution = IssueSolution(
                 project_id=project.id,
                 page_id=page_id,
                 issue_key=issue_key,
@@ -462,7 +476,9 @@ def import_project_bundle(db: Session, bundle: dict[str, Any]) -> Project:
                 issue_snapshot=item.get("issue_snapshot") or {},
                 solution_data=item.get("solution_data") or {},
                 created_at=_datetime(item.get("created_at")) or datetime.now().astimezone(),
-            ))
+            )
+            db.add(solution); db.flush()
+            if item.get("source_id"): solution_ids[str(item["source_id"])] = solution.id
         keyword_ids: dict[str, str] = {}
         for item in bundle.get("keywords", []):
             keyword = Keyword(project_id=project.id, text=str(item.get("text") or ""), locale=item.get("locale"), normalized_phrase=str(item.get("normalized_phrase") or str(item.get("text") or "").strip().casefold()), market=str(item.get("market") or ""), language=str(item.get("language") or ""), product_relevance=item.get("product_relevance"), relevance_status=str(item.get("relevance_status") or "needs_review"), relevance_notes=item.get("relevance_notes"), created_at=_datetime(item.get("created_at")) or datetime.now().astimezone(), updated_at=_datetime(item.get("updated_at")) or datetime.now().astimezone())
@@ -520,6 +536,32 @@ def import_project_bundle(db: Session, bundle: dict[str, Any]) -> Project:
             entity_type = str(item.get("entity_type") or "restored")
             entity_id = entity_maps.get(entity_type, {}).get(source_entity_id, source_entity_id)
             db.add(ReviewHistory(project_id=project.id, entity_type=entity_type, entity_id=entity_id, action=str(item.get("action") or "restored"), reviewer=item.get("reviewer"), before_data=item.get("before_data") or {}, after_data=item.get("after_data") or {}, reason=item.get("reason"), created_at=_datetime(item.get("created_at")) or datetime.now().astimezone()))
+        category_ids: dict[str, str] = {}
+        for item in bundle.get("activity_categories", []):
+            category = ActivityCategory(project_id=project.id, name=str(item.get("name") or "Restored category"), color=str(item.get("color") or "blue"), created_at=_datetime(item.get("created_at")) or datetime.now().astimezone())
+            db.add(category); db.flush()
+            if item.get("source_id"): category_ids[str(item["source_id"])] = category.id
+        for item in bundle.get("issue_snapshots", []):
+            old_page_id = str(item.get("page_source_id")) if item.get("page_source_id") else None
+            page_id = page_ids.get(old_page_id) if old_page_id else None
+            issue_key = str(item.get("issue_key") or "restored_issue")
+            if old_page_id and page_id: issue_key = issue_key.replace(f":{old_page_id}", f":{page_id}", 1)
+            db.add(IssueSnapshot(project_id=project.id, import_batch_id=batch_ids[str(item.get("batch_source_id"))], page_id=page_id, issue_key=issue_key, issue_source=str(item.get("issue_source") or "on_page"), issue_type=str(item.get("issue_type") or "restored_issue"), category=str(item.get("category") or "General"), severity=str(item.get("severity") or "review"), label=str(item.get("label") or "Restored issue"), url=item.get("url"), detail=item.get("detail"), evidence=item.get("evidence") or {}, observed_on=_date(item.get("observed_on")) or date.today(), observed_at=_datetime(item.get("observed_at")) or datetime.now().astimezone()))
+        for item in bundle.get("issue_snapshot_runs", []):
+            db.add(IssueSnapshotRun(project_id=project.id, import_batch_id=batch_ids[str(item.get("batch_source_id"))], observed_on=_date(item.get("observed_on")) or date.today(), observed_at=_datetime(item.get("observed_at")) or datetime.now().astimezone(), outstanding_count=int(item.get("outstanding_count") or 0), new_count=int(item.get("new_count") or 0), resolved_count=int(item.get("resolved_count") or 0), baseline=bool(item.get("baseline", False))))
+        activity_ids: dict[str, str] = {}
+        pending_related: list[tuple[SEOActivity, str]] = []
+        for item in bundle.get("seo_activities", []):
+            old_page_id = str(item.get("page_source_id")) if item.get("page_source_id") else None
+            page_id = page_ids.get(old_page_id) if old_page_id else None
+            issue_key = item.get("issue_key")
+            if issue_key and old_page_id and page_id: issue_key = str(issue_key).replace(f":{old_page_id}", f":{page_id}", 1)
+            activity = SEOActivity(project_id=project.id, category_id=category_ids.get(str(item.get("category_source_id"))) if item.get("category_source_id") else None, page_id=page_id, import_batch_id=batch_ids.get(str(item.get("batch_source_id"))) if item.get("batch_source_id") else None, recommendation_id=recommendation_ids.get(str(item.get("recommendation_source_id"))) if item.get("recommendation_source_id") else None, issue_solution_id=solution_ids.get(str(item.get("solution_source_id"))) if item.get("solution_source_id") else None, event_key=str(item.get("event_key") or item.get("source_id") or uid()), source=str(item.get("source") or "restored"), section=str(item.get("section") or "general"), action_type=str(item.get("action_type") or "restored_activity"), status=str(item.get("status") or "completed"), title=str(item.get("title") or "Restored activity"), notes=item.get("notes"), url=item.get("url"), issue_key=issue_key, issue_type=item.get("issue_type"), before_data=item.get("before_data") or {}, after_data=item.get("after_data") or {}, activity_metadata=item.get("activity_metadata") or {}, occurred_at=_datetime(item.get("occurred_at")) or datetime.now().astimezone(), created_at=_datetime(item.get("created_at")) or datetime.now().astimezone())
+            db.add(activity); db.flush()
+            if item.get("source_id"): activity_ids[str(item["source_id"])] = activity.id
+            if item.get("related_activity_source_id"): pending_related.append((activity, str(item["related_activity_source_id"])))
+        for activity, source_related_id in pending_related:
+            activity.related_activity_id = activity_ids.get(source_related_id)
         db.commit()
         db.refresh(project)
         return project
@@ -539,6 +581,10 @@ def delete_project_records(db: Session, project: Project) -> dict[str, int]:
     db.execute(delete(SitemapEntry).where(SitemapEntry.project_id == project.id))
     db.execute(delete(SitemapDocument).where(SitemapDocument.project_id == project.id))
     # Delete future-phase dependants before their parent Page/Keyword records.
+    db.execute(delete(SEOActivity).where(SEOActivity.project_id == project.id))
+    db.execute(delete(IssueSnapshot).where(IssueSnapshot.project_id == project.id))
+    db.execute(delete(IssueSnapshotRun).where(IssueSnapshotRun.project_id == project.id))
+    db.execute(delete(ActivityCategory).where(ActivityCategory.project_id == project.id))
     db.execute(delete(PageCrawlChange).where(PageCrawlChange.project_id == project.id))
     db.execute(delete(PageMetadataChange).where(PageMetadataChange.project_id == project.id))
     db.execute(delete(IssueSolution).where(IssueSolution.project_id == project.id))

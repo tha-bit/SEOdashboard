@@ -12,7 +12,8 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import ImportBatch, ImportRow, Page, PageCrawlChange, PageMetadataObservation, Project
+from ..models import ImportBatch, ImportRow, Page, PageCrawlChange, PageMetadataObservation, PageType, Project
+from .drafts import is_successful_html, mark_draft_live, materialize_legacy_draft_targets
 from .screaming_frog import recognize_headers, semantic_field_options, suggested_semantic_mapping
 from .page_types import is_obvious_asset
 from .urls import normalize_url
@@ -183,6 +184,7 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
     address_column = mapping.get("address")
     if not address_column:
         raise HTTPException(422, "Map a source column to URL before importing")
+    materialize_legacy_draft_targets(db, project)
     rows = db.scalars(select(ImportRow).where(ImportRow.batch_id == batch.id).order_by(ImportRow.row_number)).all()
     imported = skipped = errors = 0
     seen: set[str] = set()
@@ -220,7 +222,12 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
         seen.add(normalized)
         page = db.scalar(select(Page).where(Page.project_id == project.id, Page.normalized_url == normalized))
         if page:
-            if duplicate_strategy == "skip":
+            promotes_draft = (
+                page.page_type == PageType.DRAFT.value
+                and batch.source == "screaming_frog"
+                and is_successful_html(values["http_status"], values["content_type"])
+            )
+            if duplicate_strategy == "skip" and not promotes_draft:
                 row.validation_status = "duplicate_existing"
                 row.page_id = page.id
                 skipped += 1
@@ -236,6 +243,11 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
                     setattr(page, field_name, new_value)
             page.last_observed_at = datetime.now(timezone.utc)
             page.source = batch.source
+            if promotes_draft:
+                previous_type = page.page_type
+                new_type = mark_draft_live(db, page, values["page_type"], values["content_type"])
+                page.original_url = url
+                crawl_changes["page_type"] = {"label": "Page Type", "from": previous_type, "to": new_type}
             if page.page_type == "Unknown" and is_obvious_asset(values["content_type"], normalized):
                 page.page_type = "Asset"
             if crawl_changes:
@@ -278,5 +290,8 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
     batch.status = "completed_with_errors" if errors else "completed"
     if errors:
         batch.warnings = [*batch.warnings, f"{errors} row(s) were not imported. Review the row-level errors."]
+    if batch.source == "screaming_frog":
+        from .activity import record_issue_snapshot
+        record_issue_snapshot(db, project, batch)
     db.commit()
     return batch

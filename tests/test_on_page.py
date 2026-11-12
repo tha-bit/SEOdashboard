@@ -21,6 +21,17 @@ def import_screaming_frog(client, project_id, name, content, reporting_date=None
     return staged, confirmed.json()
 
 
+def test_on_page_metadata_summary_filter_matches_observed_pages(client, project):
+    client.post(f"/api/projects/{project['id']}/pages", json={"url": "https://shop.example.com/manual", "page_type": "Other"})
+    import_screaming_frog(client, project["id"], "metadata.csv", b"Address,Page Type,Title 1\nhttps://shop.example.com/observed,PLP,Observed title\n")
+    all_pages = client.get(f"/api/projects/{project['id']}/on-page/pages?page_size=100").json()
+    metadata_pages = client.get(f"/api/projects/{project['id']}/on-page/pages?page_size=100&metadata_only=true").json()
+    summary = client.get(f"/api/projects/{project['id']}/on-page/summary").json()
+    assert all_pages["total"] == 2
+    assert metadata_pages["total"] == summary["pages_with_metadata"] == 1
+    assert metadata_pages["items"][0]["url"].endswith("/observed")
+
+
 def test_metadata_import_provenance_field_states_and_deterministic_issues(client, project):
     content = b"""Address,Page Type,Status Code,Status,Indexability,Content Type,Title 1,Title 1 Length,Meta Description 1,H1-1,H1-2,Canonical Link Element 1,Meta Robots 1,X-Robots-Tag 1
 https://shop.example.com/category,PLP,200,OK,Indexable,text/html,Shared title,12,Shared description,Category heading,Second heading,https://shop.example.com/redirect,index follow,
@@ -37,6 +48,9 @@ https://shop.example.com/empty,Editorial,200,OK,Indexable,text/html,,0,,, ,https
     ).json()
     assert typed_rows["total"] == 2
     assert {item["page_type"] for item in typed_rows["items"]} == {"PLP", "PDP"}
+    assert client.get(f"/api/projects/{project['id']}/on-page/pages", params={"page_types": "__filter_none__"}).json()["total"] == 0
+    assert client.get(f"/api/projects/{project['id']}/on-page/pages", params={"issue_types": "__filter_none__"}).json()["total"] == 0
+    assert client.get(f"/api/projects/{project['id']}/on-page/pages", params={"review_statuses": "__filter_none__"}).json()["total"] == 0
     category = next(item for item in page_rows["items"] if item["url"].endswith("/category"))
     assert category["current"]["h1"] == ["Category heading", "Second heading"]
     assert category["field_states"]["title"] == "present"

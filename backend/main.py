@@ -16,7 +16,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from .database import Base, DATA_DIR, DATABASE_URL, engine, get_db
-from .models import CannibalizationCase, GA4PagePerformance, ImportBatch, ImportRow, IssueSolution, KeywordGroup, KeywordGroupMembership, Page, PageCrawlChange, PageMetadataRecommendation, PageType, Project, RankingObservation, SitemapEntry, TargetMapping
+from .models import CannibalizationCase, GA4PagePerformance, GSCQueryPagePerformance, ImportBatch, ImportRow, IssueSolution, KeywordGroup, KeywordGroupMembership, Page, PageCrawlChange, PageMetadataRecommendation, PageType, Project, RankingObservation, SitemapEntry, TargetMapping
 from .schemas import BulkTypeUpdate, ConfirmImport, ImportOut, IssueSolutionCreate, ManualPageCreate, PageOut, ProjectCreate, ProjectOut, ProjectUpdate
 from .services.imports import confirm_import, stage_upload
 from .services.project_bundles import delete_project_records, export_project_bundle, import_project_bundle
@@ -25,6 +25,8 @@ from .routes.architecture import router as architecture_router
 from .routes.on_page import router as on_page_router
 from .routes.keywords import router as keywords_router
 from .routes.strategy import router as strategy_router
+from .routes.activity import router as activity_router
+from .services.activity import add_activity
 from .services.on_page import latest_metadata, on_page_issues
 from .services.architecture import architecture_issues
 from .services.keywords import confirm_keyword_import, current_keyword_rows
@@ -42,6 +44,7 @@ app.include_router(architecture_router)
 app.include_router(on_page_router)
 app.include_router(keywords_router)
 app.include_router(strategy_router)
+app.include_router(activity_router)
 
 
 def project_or_404(db: Session, project_id: str) -> Project:
@@ -145,7 +148,7 @@ def issue_solution_log(project_id: str, source: str | None = None, issue_key: st
 @app.post("/api/projects/{project_id}/issue-solutions", status_code=201)
 def create_issue_solution(project_id: str, payload: IssueSolutionCreate, db: Session = Depends(get_db)):
     project = project_or_404(db, project_id)
-    workflow_statuses = {"proposed", "in_progress", "implemented", "verified"}
+    workflow_statuses = {"proposed", "ignored", "in_progress", "implemented", "verified"}
     actions = {
         "site_architecture": {"sitemap_change", "hierarchy_change", "classification_change", "response_remediation", "sitemap_evidence", "other"},
         "on_page": {"content_update", "canonical_robots_update", "hreflang_update", "technical_review", "other"},
@@ -153,7 +156,7 @@ def create_issue_solution(project_id: str, payload: IssueSolutionCreate, db: Ses
     if payload.source not in actions:
         raise HTTPException(422, "Issue source must be site_architecture or on_page")
     if payload.workflow_status not in workflow_statuses:
-        raise HTTPException(422, "Solution stage must be proposed, in_progress, implemented, or verified")
+        raise HTTPException(422, "Solution stage must be proposed, ignored, in_progress, implemented, or verified")
     if payload.action not in actions[payload.source]:
         raise HTTPException(422, "Solution action is not valid for this issue source")
     issue = next((item for item in unified_issue_rows(db, project, "All") if item["source"] == payload.source and item["issue_key"] == payload.issue_key), None)
@@ -201,6 +204,16 @@ def create_issue_solution(project_id: str, payload: IssueSolutionCreate, db: Ses
         solution_data=payload.data,
     )
     db.add(solution)
+    db.flush()
+    status_map = {"proposed": "in_progress", "ignored": "ignored", "in_progress": "in_progress", "implemented": "completed", "verified": "resolved"}
+    add_activity(
+        db, project.id, event_key=f"issue-solution:{solution.id}", source="issue_solution", section=payload.source,
+        action_type="solution_completed" if payload.workflow_status in {"implemented", "verified"} else "solution_logged",
+        status=status_map[payload.workflow_status], title=f"{issue['label']}: {payload.action.replace('_', ' ')}",
+        notes=summary, page_id=issue.get("page_id"), issue_solution_id=solution.id, url=issue.get("url"),
+        issue_key=payload.issue_key, issue_type=issue["type"], before_data={"issue": snapshot},
+        after_data={"workflow_status": payload.workflow_status, "solution": payload.data},
+    )
     db.commit()
     db.refresh(solution)
     return serialize_issue_solution(solution)
@@ -291,17 +304,65 @@ def delete_project(project_id: str, confirm_name: str = Query(...), db: Session 
 @app.get("/api/projects/{project_id}/dashboard")
 def dashboard(project_id: str, db: Session = Depends(get_db)):
     project = project_or_404(db, project_id)
-    total = db.scalar(select(func.count(Page.id)).where(Page.project_id == project_id)) or 0
-    type_rows = db.execute(select(Page.page_type, func.count(Page.id)).where(Page.project_id == project_id).group_by(Page.page_type)).all()
+    live_pages = list(db.scalars(select(Page).where(Page.project_id == project_id, Page.page_type != PageType.DRAFT.value)))
+    total = len(live_pages)
+    type_rows = db.execute(select(Page.page_type, func.count(Page.id)).where(Page.project_id == project_id, Page.page_type != PageType.DRAFT.value).group_by(Page.page_type)).all()
     latest = db.scalar(select(ImportBatch).where(ImportBatch.project_id == project_id).order_by(ImportBatch.imported_at.desc()).limit(1))
     warning_count = db.scalar(select(func.count(ImportBatch.id)).where(ImportBatch.project_id == project_id, ImportBatch.warnings != [])) or 0
     metadata = latest_metadata(db, project_id)
     metadata_issues = [issue for issue in on_page_issues(db, project, metadata) if issue["status"] == "open"]
+    architecture_errors = [issue for issue in architecture_issues(db, project) if issue["severity"] == "error"]
     pending_recommendations = db.scalar(select(func.count(PageMetadataRecommendation.id)).where(PageMetadataRecommendation.project_id == project_id, PageMetadataRecommendation.review_status != "implemented")) or 0
     keyword_rows = current_keyword_rows(db, project)
+
+    indexable_pages = 0
+    non_indexable_pages = 0
+    for page in live_pages:
+        indexability = (page.indexability or "").strip().casefold()
+        if not indexability:
+            continue
+        if "non-indexable" in indexability or "non indexable" in indexability or indexability.startswith("non"):
+            non_indexable_pages += 1
+        elif "indexable" in indexability:
+            indexable_pages += 1
+
+    latest_gsc_batch = db.scalar(
+        select(ImportBatch)
+        .join(GSCQueryPagePerformance, GSCQueryPagePerformance.import_batch_id == ImportBatch.id)
+        .where(ImportBatch.project_id == project_id)
+        .order_by(ImportBatch.imported_at.desc(), ImportBatch.id.desc())
+        .limit(1)
+    )
+    gsc_rows = list(db.scalars(select(GSCQueryPagePerformance).where(GSCQueryPagePerformance.import_batch_id == latest_gsc_batch.id))) if latest_gsc_batch else []
+    click_values = [row.clicks for row in gsc_rows if row.clicks is not None]
+    impression_values = [row.impressions for row in gsc_rows if row.impressions is not None]
+    weighted_positions = [(row.average_position, row.impressions) for row in gsc_rows if row.average_position is not None and row.impressions is not None and row.impressions > 0]
+    position_values = [row.average_position for row in gsc_rows if row.average_position is not None]
+    if weighted_positions:
+        average_position = sum(position * impressions for position, impressions in weighted_positions) / sum(impressions for _, impressions in weighted_positions)
+    elif position_values:
+        average_position = sum(position_values) / len(position_values)
+    else:
+        average_position = None
+
+    latest_ga4_batch = db.scalar(
+        select(ImportBatch)
+        .join(GA4PagePerformance, GA4PagePerformance.import_batch_id == ImportBatch.id)
+        .where(ImportBatch.project_id == project_id)
+        .order_by(ImportBatch.imported_at.desc(), ImportBatch.id.desc())
+        .limit(1)
+    )
+    ga4_rows = list(db.scalars(select(GA4PagePerformance).where(GA4PagePerformance.import_batch_id == latest_ga4_batch.id))) if latest_ga4_batch else []
+    organic_ga4_rows = [row for row in ga4_rows if row.channel_filter and "organic" in row.channel_filter.casefold()]
+    organic_session_values = [row.sessions for row in organic_ga4_rows if row.sessions is not None]
+
+    gsc_period_starts = [row.period_start for row in gsc_rows if row.period_start]
+    gsc_period_ends = [row.period_end for row in gsc_rows if row.period_end]
+    ga4_period_starts = [row.period_start for row in organic_ga4_rows if row.period_start]
+    ga4_period_ends = [row.period_end for row in organic_ga4_rows if row.period_end]
     return {
         "total_pages": total,
-        "imported_pages": db.scalar(select(func.count(Page.id)).where(Page.project_id == project_id, Page.source != "manual")) or 0,
+        "imported_pages": db.scalar(select(func.count(Page.id)).where(Page.project_id == project_id, Page.page_type != PageType.DRAFT.value, Page.source != "manual")) or 0,
         "unknown_pages": dict(type_rows).get(PageType.UNKNOWN.value, 0),
         "imported_sitemap_pages": db.scalar(select(func.count(func.distinct(SitemapEntry.page_id))).where(SitemapEntry.project_id == project_id, SitemapEntry.page_id.is_not(None))) or 0,
         "by_type": {key: count for key, count in type_rows},
@@ -320,11 +381,25 @@ def dashboard(project_id: str, db: Session = Depends(get_db)):
         "mapped_keywords": db.scalar(select(func.count(func.distinct(KeywordGroupMembership.keyword_id))).where(KeywordGroupMembership.project_id == project_id, KeywordGroupMembership.status == "approved")) or 0,
         "approved_targets": db.scalar(select(func.count(TargetMapping.id)).where(TargetMapping.project_id == project_id, TargetMapping.status == "approved")) or 0,
         "cannibalization_reviews": db.scalar(select(func.count(CannibalizationCase.id)).where(CannibalizationCase.project_id == project_id, CannibalizationCase.status.in_(["new", "needs_investigation", "reopened"]))) or 0,
+        "indexable_pages": indexable_pages,
+        "non_indexable_pages": non_indexable_pages,
+        "indexability_observed_pages": indexable_pages + non_indexable_pages,
+        "critical_issue_count": len(architecture_errors) + sum(issue["severity"] == "high" for issue in metadata_issues),
+        "critical_architecture_issues": len(architecture_errors),
+        "critical_on_page_issues": sum(issue["severity"] == "high" for issue in metadata_issues),
+        "organic_sessions": sum(organic_session_values) if organic_session_values else None,
+        "organic_clicks": sum(click_values) if click_values else None,
+        "organic_impressions": sum(impression_values) if impression_values else None,
+        "average_position": average_position,
+        "gsc_period_start": min(gsc_period_starts) if gsc_period_starts else None,
+        "gsc_period_end": max(gsc_period_ends) if gsc_period_ends else None,
+        "ga4_period_start": min(ga4_period_starts) if ga4_period_starts else None,
+        "ga4_period_end": max(ga4_period_ends) if ga4_period_ends else None,
     }
 
 
 def page_statement(project_id: str, search: str | None, page_type: str | None, indexability: str | None, status: int | None, source: str | None, classification: str | None = None, page_types: list[str] | None = None):
-    statement = select(Page).where(Page.project_id == project_id)
+    statement = select(Page).where(Page.project_id == project_id, Page.page_type != PageType.DRAFT.value)
     if search:
         statement = statement.where(or_(Page.original_url.ilike(f"%{search}%"), Page.normalized_url.ilike(f"%{search}%")))
     if page_types:
@@ -341,6 +416,8 @@ def page_statement(project_id: str, search: str | None, page_type: str | None, i
         statement = statement.where(Page.page_type != PageType.UNKNOWN.value)
     elif classification == "unassigned":
         statement = statement.where(Page.page_type == PageType.UNKNOWN.value)
+    elif classification == "__filter_none__":
+        statement = statement.where(Page.id.is_(None))
     return statement
 
 
@@ -413,6 +490,8 @@ def add_page(project_id: str, payload: ManualPageCreate, db: Session = Depends(g
         raise HTTPException(422, "Unsupported page type")
     page = Page(project_id=project_id, original_url=payload.url.strip(), normalized_url=identity, page_type=payload.page_type, source="manual")
     db.add(page)
+    db.flush()
+    add_activity(db, project.id, source="manual", section="keyword" if payload.page_type == PageType.DRAFT.value else "pages", action_type="page_added", status="changed", title=f"Page added: {page.original_url}", page_id=page.id, url=page.original_url, after_data={"page_type": page.page_type, "normalized_url": page.normalized_url})
     db.commit()
     db.refresh(page)
     return page
@@ -420,12 +499,15 @@ def add_page(project_id: str, payload: ManualPageCreate, db: Session = Depends(g
 
 @app.patch("/api/projects/{project_id}/pages/bulk-type")
 def bulk_page_type(project_id: str, payload: BulkTypeUpdate, db: Session = Depends(get_db)):
-    project_or_404(db, project_id)
+    project = project_or_404(db, project_id)
     if payload.page_type not in {item.value for item in PageType}:
         raise HTTPException(422, "Unsupported page type")
     pages = db.scalars(select(Page).where(Page.project_id == project_id, Page.id.in_(payload.page_ids))).all()
+    changes = []
     for page in pages:
+        changes.append({"page_id": page.id, "url": page.original_url, "from": page.page_type, "to": payload.page_type})
         page.page_type = payload.page_type
+    add_activity(db, project.id, source="pages", section="pages", action_type="page_type_changed", status="changed", title=f"Changed page type for {len(pages)} page{'s' if len(pages) != 1 else ''}", after_data={"changes": changes})
     db.commit()
     return {"updated": len(pages)}
 

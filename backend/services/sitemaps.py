@@ -13,7 +13,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import Page, Project, SitemapDocument, SitemapEntry
+from ..models import Page, PageType, Project, SitemapDocument, SitemapEntry
 from .urls import normalize_url
 
 SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
@@ -238,7 +238,7 @@ def generate_sitemap_files(
 
 
 def proposed_sitemap_urls(db: Session, project: Project) -> tuple[list[str], list[dict]]:
-    pages = db.scalars(select(Page).where(Page.project_id == project.id, Page.sitemap_included.is_(True)).order_by(Page.normalized_url)).all()
+    pages = db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value, Page.sitemap_included.is_(True)).order_by(Page.normalized_url)).all()
     urls: list[str] = []
     issues: list[dict] = []
     host = urlsplit(project.site_url).hostname

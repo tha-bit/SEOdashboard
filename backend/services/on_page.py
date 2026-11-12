@@ -252,7 +252,18 @@ def save_recommendation(db: Session, project: Project, page: Page, data: dict, r
     item.updated_at = now
     item.implemented_at = now if review_status == "implemented" else None
     changes = {"old": {"data": old["data"], "review_status": old["review_status"], "notes": old["notes"]}, "new": {"data": cleaned, "review_status": review_status, "notes": notes}}
-    db.add(PageMetadataChange(project_id=project.id, page_id=page.id, recommendation_id=item.id, reviewer=reviewer, changes=changes, changed_at=now))
+    change = PageMetadataChange(project_id=project.id, page_id=page.id, recommendation_id=item.id, reviewer=reviewer, changes=changes, changed_at=now)
+    db.add(change)
+    db.flush()
+    from .activity import add_activity
+    status_map = {"draft": "in_progress", "review": "in_progress", "approved": "in_progress", "implemented": "completed"}
+    action_type = "recommendation_created" if old["review_status"] is None else ("recommendation_completed" if review_status == "implemented" else "recommendation_status_changed")
+    add_activity(
+        db, project.id, event_key=f"recommendation-change:{change.id}", source="on_page_recommendation", section="on_page",
+        action_type=action_type, status=status_map[review_status], title=f"On-page recommendation {review_status}: {page.original_url}",
+        notes=notes, page_id=page.id, recommendation_id=item.id, url=page.original_url,
+        before_data=changes["old"], after_data=changes["new"], occurred_at=now,
+    )
     db.commit()
     db.refresh(item)
     return item

@@ -14,6 +14,7 @@ from ..database import get_db
 from ..models import AuditCase, Page, PageMetadataChange, PageMetadataObservation, PageMetadataRecommendation, PageRelationship, Project, SitemapEntry
 from ..schemas import OnPageBulkReviewUpdate, OnPageIssueUpdate, OnPageRecommendationUpdate, OnPageThresholdUpdate
 from ..services.on_page import DEFAULT_THRESHOLDS, latest_metadata, on_page_issues, recommendation_for, save_recommendation, serialize_recommendation, thresholds
+from ..services.activity import add_activity
 
 router = APIRouter(prefix="/api/projects/{project_id}/on-page", tags=["on-page-seo"])
 
@@ -98,7 +99,7 @@ def summary(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/pages")
-def pages(project_id: str, search: str | None = None, page_type: str | None = None, page_types: list[str] | None = Query(None), issue_type: str | None = None, issue_types: list[str] | None = Query(None), review_status: str | None = None, review_statuses: list[str] | None = Query(None), page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=250), db: Session = Depends(get_db)):
+def pages(project_id: str, search: str | None = None, page_type: str | None = None, page_types: list[str] | None = Query(None), issue_type: str | None = None, issue_types: list[str] | None = Query(None), review_status: str | None = None, review_statuses: list[str] | None = Query(None), metadata_only: bool = False, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=250), db: Session = Depends(get_db)):
     project = project_or_404(db, project_id)
     snapshots, _, issues_by_page, recommendations, sitemap_counts, parents = _context(db, project)
     statement = select(Page).where(Page.project_id == project.id)
@@ -109,6 +110,8 @@ def pages(project_id: str, search: str | None = None, page_type: str | None = No
     elif page_type and page_type != "All":
         statement = statement.where(Page.page_type == page_type)
     candidates = list(db.scalars(statement.order_by(Page.normalized_url)))
+    if metadata_only:
+        candidates = [item for item in candidates if item.id in snapshots]
     selected_issue_types = issue_types or ([issue_type] if issue_type and issue_type != "All" else [])
     if selected_issue_types:
         candidates = [item for item in candidates if any(issue["type"] in selected_issue_types and issue["status"] == "open" for issue in issues_by_page.get(item.id, []))]
@@ -185,6 +188,14 @@ def update_issue(project_id: str, issue_key: str, payload: OnPageIssueUpdate, db
     case.reason = payload.reason.strip() if payload.reason else None
     case.updated_at = datetime.now(timezone.utc)
     case.evidence = {"issue_type": matching["type"], "label": matching["label"], "url": matching["url"]}
+    db.flush()
+    status_map = {"open": "in_progress", "dismissed": "ignored", "resolved": "resolved"}
+    add_activity(
+        db, project.id, event_key=f"audit-case:{case.id}:{case.updated_at.isoformat()}", source="issue_review", section="on_page",
+        action_type="issue_status_changed", status=status_map[payload.status], title=f"{matching['label']}: {payload.status}",
+        notes=case.reason, page_id=matching["page_id"], url=matching["url"], issue_key=issue_key, issue_type=matching["type"],
+        before_data={"detected": True}, after_data={"review_status": payload.status}, occurred_at=case.updated_at,
+    )
     db.commit()
     return {"issue_key": issue_key, "status": case.status, "reason": case.reason}
 

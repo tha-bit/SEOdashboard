@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from ..models import Page, PageRelationship, Project, SitemapDocument, SitemapEntry
+from ..models import Page, PageRelationship, PageType, Project, SitemapDocument, SitemapEntry
 
 PRIMARY = "primary_parent"
 
@@ -23,7 +23,8 @@ def issue_category(issue_type: str) -> str:
 
 
 def approved_primary(db: Session, project_id: str) -> list[PageRelationship]:
-    return list(db.scalars(select(PageRelationship).where(PageRelationship.project_id == project_id, PageRelationship.relationship_type == PRIMARY, PageRelationship.status == "approved")))
+    live_ids = select(Page.id).where(Page.project_id == project_id, Page.page_type != PageType.DRAFT.value)
+    return list(db.scalars(select(PageRelationship).where(PageRelationship.project_id == project_id, PageRelationship.relationship_type == PRIMARY, PageRelationship.status == "approved", PageRelationship.source_page_id.in_(live_ids), PageRelationship.target_page_id.in_(live_ids))))
 
 
 def parent_map(db: Session, project_id: str) -> dict[str, str]:
@@ -32,7 +33,7 @@ def parent_map(db: Session, project_id: str) -> dict[str, str]:
 
 def hierarchy_depths(db: Session, project_id: str) -> dict[str, int | None]:
     parents = parent_map(db, project_id)
-    page_ids = list(db.scalars(select(Page.id).where(Page.project_id == project_id)))
+    page_ids = list(db.scalars(select(Page.id).where(Page.project_id == project_id, Page.page_type != PageType.DRAFT.value)))
     depths: dict[str, int | None] = {}
     for page_id in page_ids:
         cursor = page_id
@@ -85,6 +86,8 @@ def set_relationship(db: Session, project: Project, parent_id: str, child_id: st
     child = db.get(Page, child_id)
     if not parent or not child or parent.project_id != project.id or child.project_id != project.id:
         raise HTTPException(404, "Parent or child page not found in this project")
+    if parent.page_type == PageType.DRAFT.value or child.page_type == PageType.DRAFT.value:
+        raise HTTPException(422, "Draft pages are not available in Site Architecture")
     if relationship_type == PRIMARY:
         if status == "approved" and would_cycle(db, project.id, parent_id, child_id):
             raise HTTPException(422, "This parent assignment would create a circular hierarchy")
@@ -109,7 +112,7 @@ def set_relationship(db: Session, project: Project, parent_id: str, child_id: st
 
 
 def propose_parents(db: Session, project: Project) -> dict:
-    pages = list(db.scalars(select(Page).where(Page.project_id == project.id)))
+    pages = list(db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value)))
     approved_children = set(parent_map(db, project.id))
     by_path: dict[tuple[str, str], Page] = {}
     for page in pages:
@@ -191,10 +194,12 @@ def approve_parent_proposals(db: Session, project: Project, relationship_ids: li
 
 
 def architecture_issues(db: Session, project: Project) -> list[dict]:
-    pages = list(db.scalars(select(Page).where(Page.project_id == project.id)))
+    pages = list(db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value)))
+    pages_by_id = {page.id: page for page in pages}
     parents = parent_map(db, project.id)
     depths = hierarchy_depths(db, project.id)
-    imported_sitemap_page_ids = set(db.scalars(select(SitemapEntry.page_id).where(SitemapEntry.project_id == project.id, SitemapEntry.page_id.is_not(None))))
+    imported_sitemap_counts = Counter(db.scalars(select(SitemapEntry.page_id).where(SitemapEntry.project_id == project.id, SitemapEntry.page_id.is_not(None))))
+    imported_sitemap_page_ids = set(imported_sitemap_counts)
     issues: list[dict] = []
     for page in pages:
         path_depth = len([part for part in urlsplit(page.normalized_url).path.split("/") if part])
@@ -228,13 +233,30 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
         issues.append({"type": "imported_sitemap_url_issue", "severity": "warning", "page_id": entry.page_id, "url": entry.loc, "label": "Imported sitemap URL needs review", "detail": entry.issue})
     for issue in issues:
         issue["category"] = issue_category(issue["type"])
+        page = pages_by_id.get(issue.get("page_id"))
+        parent = pages_by_id.get(parents.get(page.id)) if page and parents.get(page.id) else None
+        path_depth = len([part for part in urlsplit(page.normalized_url).path.split("/") if part]) if page else None
+        issue.update({
+            "page_type": page.page_type if page else None,
+            "content_type": page.content_type if page else None,
+            "http_status": page.http_status if page else None,
+            "http_status_text": page.http_status_text if page else None,
+            "indexability": page.indexability if page else None,
+            "indexability_status": page.indexability_status if page else None,
+            "sitemap_included": page.sitemap_included if page else None,
+            "imported_sitemap_occurrences": imported_sitemap_counts.get(page.id, 0) if page else 0,
+            "architecture_section": page.architecture_section if page else None,
+            "path_depth": path_depth,
+            "hierarchy_depth": depths.get(page.id) if page else None,
+            "parent_url": parent.original_url if parent else None,
+        })
     return issues
 
 
 def tree_scopes(db: Session, project: Project) -> list[dict]:
     counts: Counter[tuple[str, str]] = Counter()
     host_counts: Counter[str] = Counter()
-    for page in db.scalars(select(Page).where(Page.project_id == project.id)):
+    for page in db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value)):
         parts = urlsplit(page.normalized_url)
         host = parts.netloc.lower()
         first_segment = next((segment for segment in parts.path.split("/") if segment), "")
@@ -259,7 +281,7 @@ def tree_nodes(db: Session, project: Project, parent_id: str | None, orphans: bo
     for relationship in relationships:
         children[relationship.source_page_id].append(relationship.target_page_id)
         parents[relationship.target_page_id] = relationship.source_page_id
-    pages = {page.id: page for page in db.scalars(select(Page).where(Page.project_id == project.id))}
+    pages = {page.id: page for page in db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value))}
     scoped_ids: set[str] | None = None
     if scope:
         try:

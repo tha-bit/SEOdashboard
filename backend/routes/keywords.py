@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import GA4PagePerformance, GSCQueryPagePerformance, ImportBatch, Keyword, KeywordMetricsSnapshot, Page, Project, RankingObservation
-from ..services.keywords import current_keyword_rows, score_settings
+from ..models import CannibalizationCase, CannibalizationEvidence, CaseDecision, GA4PagePerformance, GSCQueryPagePerformance, GroupingSuggestion, ImportBatch, Keyword, KeywordGroup, KeywordGroupMembership, KeywordMetricsSnapshot, Page, Project, RankingObservation, TargetMapping
+from ..services.keywords import KNOWN_INTENTS, current_keyword_rows, normalize_phrase, score_settings
 
 router = APIRouter(prefix="/api/projects/{project_id}/keywords", tags=["keywords"])
 
@@ -35,9 +36,138 @@ class ScoringUpdate(BaseModel):
     intent_scores: dict[str, float]
 
 
+class SavedKeywordInput(BaseModel):
+    keyword: str = Field(min_length=1, max_length=1000)
+    volume: int | None = Field(default=None, ge=0, le=2_000_000_000)
+    keyword_difficulty: float | None = Field(default=None, ge=0, le=100)
+    intent: str | None = Field(default=None, max_length=80)
+    market: str | None = Field(default=None, max_length=80)
+    language: str | None = Field(default=None, max_length=40)
+
+
+class SavedKeywordCreate(BaseModel):
+    entries: list[SavedKeywordInput] = Field(min_length=1, max_length=500)
+
+
+class SavedKeywordUpdate(BaseModel):
+    keyword: str = Field(min_length=1, max_length=1000)
+    volume: int | None = Field(default=None, ge=0, le=2_000_000_000)
+    keyword_difficulty: float | None = Field(default=None, ge=0, le=100)
+    intents: list[str] = Field(default_factory=list, max_length=4)
+
+
 @router.get("")
 def keyword_explorer(project_id: str, db: Session = Depends(get_db)):
     return current_keyword_rows(db, project_or_404(db, project_id))
+
+
+@router.post("", status_code=201)
+def save_keywords(project_id: str, payload: SavedKeywordCreate, db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id)
+    created = updated = 0
+    keyword_ids: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in payload.entries:
+        normalized = normalize_phrase(entry.keyword)
+        if not normalized:
+            raise HTTPException(422, "Keyword text cannot be empty")
+        market = (entry.market or project.market or "").strip()
+        language = (entry.language or "").strip()
+        identity = (normalized, market, language)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        keyword = db.scalar(select(Keyword).where(Keyword.project_id == project_id, Keyword.normalized_phrase == normalized, Keyword.market == market, Keyword.language == language))
+        if not keyword and entry.market is None and entry.language is None:
+            keyword = db.scalar(select(Keyword).where(Keyword.project_id == project_id, Keyword.normalized_phrase == normalized).order_by(Keyword.created_at))
+        if not keyword:
+            keyword = Keyword(project_id=project_id, text=entry.keyword.strip(), normalized_phrase=normalized, locale=project.locale, market=market, language=language)
+            db.add(keyword)
+            db.flush()
+            created += 1
+        else:
+            updated += 1
+        supplied = [key for key, value in (("volume", entry.volume), ("keyword_difficulty", entry.keyword_difficulty), ("intent", entry.intent)) if value is not None and value != ""]
+        if supplied:
+            latest_date = db.scalar(select(KeywordMetricsSnapshot.observed_on).where(KeywordMetricsSnapshot.project_id == project_id, KeywordMetricsSnapshot.keyword_id == keyword.id).order_by(KeywordMetricsSnapshot.observed_on.desc()))
+            observed_on = max(date.today(), latest_date) if latest_date else date.today()
+            db.add(KeywordMetricsSnapshot(project_id=project_id, keyword_id=keyword.id, provider="manual", observed_on=observed_on, market=keyword.market, device="", volume=entry.volume, keyword_difficulty=entry.keyword_difficulty, intent=(entry.intent or "").strip() or None, supplied_fields=supplied, raw_data={"source": "saved_keywords_manual_entry"}))
+        keyword_ids.append(keyword.id)
+    db.commit()
+    return {"created": created, "updated": updated, "keyword_ids": keyword_ids}
+
+
+@router.patch("/{keyword_id}/details")
+def update_saved_keyword(project_id: str, keyword_id: str, payload: SavedKeywordUpdate, db: Session = Depends(get_db)):
+    keyword = db.get(Keyword, keyword_id)
+    if not keyword or keyword.project_id != project_id:
+        raise HTTPException(404, "Keyword not found")
+    normalized = normalize_phrase(payload.keyword)
+    if not normalized:
+        raise HTTPException(422, "Keyword text cannot be empty")
+    conflict = db.scalar(select(Keyword).where(Keyword.project_id == project_id, Keyword.normalized_phrase == normalized, Keyword.market == keyword.market, Keyword.language == keyword.language, Keyword.id != keyword.id))
+    if conflict:
+        raise HTTPException(409, "Another saved keyword already uses this text in the same market and language")
+    intents = []
+    for value in payload.intents:
+        normalized_intent = value.strip().casefold()
+        if normalized_intent not in KNOWN_INTENTS:
+            raise HTTPException(422, f"Unsupported search intent: {value}")
+        label = normalized_intent.capitalize()
+        if label not in intents:
+            intents.append(label)
+    keyword.text = payload.keyword.strip()
+    keyword.normalized_phrase = normalized
+    latest_date = db.scalar(select(KeywordMetricsSnapshot.observed_on).where(KeywordMetricsSnapshot.project_id == project_id, KeywordMetricsSnapshot.keyword_id == keyword.id).order_by(KeywordMetricsSnapshot.observed_on.desc()))
+    observed_on = max(date.today(), latest_date) if latest_date else date.today()
+    db.add(KeywordMetricsSnapshot(project_id=project_id, keyword_id=keyword.id, provider="manual", observed_on=observed_on, market=keyword.market, device="", volume=payload.volume, keyword_difficulty=payload.keyword_difficulty, intent=", ".join(intents) or None, supplied_fields=["volume", "keyword_difficulty", "intent"], raw_data={"source": "saved_keywords_editor"}))
+    db.commit()
+    return next(item for item in current_keyword_rows(db, project_or_404(db, project_id)) if item["id"] == keyword.id)
+
+
+@router.delete("/{keyword_id}")
+def delete_saved_keyword(project_id: str, keyword_id: str, db: Session = Depends(get_db)):
+    keyword = db.get(Keyword, keyword_id)
+    if not keyword or keyword.project_id != project_id:
+        raise HTTPException(404, "Keyword not found")
+    memberships = db.scalars(select(KeywordGroupMembership).where(KeywordGroupMembership.project_id == project_id, KeywordGroupMembership.keyword_id == keyword_id)).all()
+    affected_groups = {membership.group_id for membership in memberships}
+    for membership in memberships:
+        db.delete(membership)
+    db.flush()
+    for group_id in affected_groups:
+        group = db.get(KeywordGroup, group_id)
+        if not group:
+            continue
+        remaining = db.scalars(select(KeywordGroupMembership).where(KeywordGroupMembership.project_id == project_id, KeywordGroupMembership.group_id == group_id).order_by(KeywordGroupMembership.created_at, KeywordGroupMembership.id)).all()
+        if not remaining:
+            cases = db.scalars(select(CannibalizationCase).where(CannibalizationCase.project_id == project_id, CannibalizationCase.group_id == group_id)).all()
+            for case in cases:
+                db.execute(delete(CaseDecision).where(CaseDecision.case_id == case.id))
+                db.execute(delete(CannibalizationEvidence).where(CannibalizationEvidence.case_id == case.id))
+                db.delete(case)
+            db.execute(delete(TargetMapping).where(TargetMapping.project_id == project_id, TargetMapping.group_id == group_id))
+            db.execute(delete(GroupingSuggestion).where(GroupingSuggestion.project_id == project_id, GroupingSuggestion.suggested_group_id == group_id))
+            db.delete(group)
+        elif group.primary_keyword_id == keyword_id:
+            replacement = next((item for item in remaining if item.status == "approved"), remaining[0])
+            group.primary_keyword_id = replacement.keyword_id
+            for item in remaining:
+                item.role = "primary" if item.id == replacement.id else "supporting"
+    cases = db.scalars(select(CannibalizationCase).where(CannibalizationCase.project_id == project_id, CannibalizationCase.keyword_id == keyword_id)).all()
+    for case in cases:
+        db.execute(delete(CaseDecision).where(CaseDecision.case_id == case.id))
+        db.execute(delete(CannibalizationEvidence).where(CannibalizationEvidence.case_id == case.id))
+        db.delete(case)
+    db.execute(delete(GroupingSuggestion).where(GroupingSuggestion.project_id == project_id, GroupingSuggestion.keyword_id == keyword_id))
+    db.execute(delete(KeywordMetricsSnapshot).where(KeywordMetricsSnapshot.project_id == project_id, KeywordMetricsSnapshot.keyword_id == keyword_id))
+    db.execute(delete(RankingObservation).where(RankingObservation.project_id == project_id, RankingObservation.keyword_id == keyword_id))
+    db.execute(delete(GSCQueryPagePerformance).where(GSCQueryPagePerformance.project_id == project_id, GSCQueryPagePerformance.keyword_id == keyword_id))
+    for mapping in db.scalars(select(TargetMapping).where(TargetMapping.project_id == project_id, TargetMapping.keyword_id == keyword_id)).all():
+        mapping.keyword_id = None
+    db.delete(keyword)
+    db.commit()
+    return {"deleted": True, "id": keyword_id}
 
 
 @router.get("/summary")
@@ -94,11 +224,11 @@ def update_relevance(project_id: str, keyword_id: str, payload: RelevanceUpdate,
 def export_keywords(project_id: str, db: Session = Depends(get_db)):
     rows = current_keyword_rows(db, project_or_404(db, project_id))
     output = io.StringIO()
-    fields = ["Keyword", "Market", "Volume", "KD", "Intent", "Best Semrush Position", "Rank Band", "Ranking URLs", "GSC Clicks", "GSC Impressions", "Product Relevance", "Opportunity Score", "Opportunity Band", "Provisional"]
+    fields = ["Keyword", "Market", "Volume", "KD", "Intent", "Best Semrush Position", "Rank Band", "Associated URL Count", "Associated URLs", "Mapped URL Count", "Mapped URLs", "Ranking URLs", "GSC Clicks", "GSC Impressions", "Product Relevance", "Opportunity Score", "Opportunity Band", "Provisional"]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     for item in rows:
-        writer.writerow({"Keyword": item["keyword"], "Market": item["market"], "Volume": item["volume"], "KD": item["keyword_difficulty"], "Intent": item["intent"], "Best Semrush Position": item["best_semrush_position"], "Rank Band": item["rank_band"], "Ranking URLs": " | ".join(item["ranking_urls"]), "GSC Clicks": item["gsc_clicks"], "GSC Impressions": item["gsc_impressions"], "Product Relevance": item["product_relevance"], "Opportunity Score": item["opportunity"]["score"], "Opportunity Band": item["opportunity"]["band"], "Provisional": item["opportunity"]["provisional"]})
+        writer.writerow({"Keyword": item["keyword"], "Market": item["market"], "Volume": item["volume"], "KD": item["keyword_difficulty"], "Intent": item["intent"], "Best Semrush Position": item["best_semrush_position"], "Rank Band": item["rank_band"], "Associated URL Count": item["associated_url_count"], "Associated URLs": " | ".join(association["url"] for association in item["url_associations"]), "Mapped URL Count": item["assigned_url_count"], "Mapped URLs": " | ".join(item["assigned_urls"]), "Ranking URLs": " | ".join(item["ranking_urls"]), "GSC Clicks": item["gsc_clicks"], "GSC Impressions": item["gsc_impressions"], "Product Relevance": item["product_relevance"], "Opportunity Score": item["opportunity"]["score"], "Opportunity Band": item["opportunity"]["band"], "Provisional": item["opportunity"]["provisional"]})
     return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=keyword-opportunities.csv"})
 
 

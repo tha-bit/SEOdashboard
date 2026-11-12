@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import Page, PageRelationship, Project
+from ..models import Page, PageRelationship, PageType, Project
 
 
 def _scope_parts(scope: str) -> tuple[str, str]:
@@ -30,7 +30,7 @@ def scope_filename(scope: str) -> str:
 
 def hierarchy_svg(db: Session, project: Project, scope: str) -> bytes:
     scope_host, prefix = _scope_parts(scope)
-    all_pages = list(db.scalars(select(Page).where(Page.project_id == project.id)))
+    all_pages = list(db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value)))
     pages = {}
     for page in all_pages:
         parts = urlsplit(page.normalized_url)

@@ -19,6 +19,7 @@ def now() -> datetime:
 
 
 class PageType(str, enum.Enum):
+    DRAFT = "Draft"
     HOMEPAGE = "Homepage"
     PLP = "PLP"
     PDP = "PDP"
@@ -457,3 +458,79 @@ class IssueSolution(Base):
     issue_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     solution_data: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+
+
+class ActivityCategory(Base):
+    __tablename__ = "activity_categories"
+    __table_args__ = (UniqueConstraint("project_id", "name", name="uq_activity_category_name"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    color: Mapped[str] = mapped_column(String(24), default="blue")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class IssueSnapshot(Base):
+    """An immutable issue observation tied to one completed crawl."""
+
+    __tablename__ = "issue_snapshots"
+    __table_args__ = (UniqueConstraint("project_id", "import_batch_id", "issue_key", name="uq_issue_snapshot_batch_key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    import_batch_id: Mapped[str] = mapped_column(ForeignKey("import_batches.id"), index=True)
+    page_id: Mapped[str | None] = mapped_column(ForeignKey("pages.id"), index=True)
+    issue_key: Mapped[str] = mapped_column(String(2048), index=True)
+    issue_source: Mapped[str] = mapped_column(String(40), index=True)
+    issue_type: Mapped[str] = mapped_column(String(255), index=True)
+    category: Mapped[str] = mapped_column(String(255), default="General", index=True)
+    severity: Mapped[str] = mapped_column(String(40), default="review")
+    label: Mapped[str] = mapped_column(String(500))
+    url: Mapped[str | None] = mapped_column(String(4096))
+    detail: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    observed_on: Mapped[date] = mapped_column(Date, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+
+
+class IssueSnapshotRun(Base):
+    __tablename__ = "issue_snapshot_runs"
+    __table_args__ = (UniqueConstraint("project_id", "import_batch_id", name="uq_issue_snapshot_run_batch"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    import_batch_id: Mapped[str] = mapped_column(ForeignKey("import_batches.id"), index=True)
+    observed_on: Mapped[date] = mapped_column(Date, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    outstanding_count: Mapped[int] = mapped_column(Integer, default=0)
+    new_count: Mapped[int] = mapped_column(Integer, default=0)
+    resolved_count: Mapped[int] = mapped_column(Integer, default=0)
+    baseline: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class SEOActivity(Base):
+    """Append-only human and system activity record."""
+
+    __tablename__ = "seo_activities"
+    __table_args__ = (UniqueConstraint("project_id", "event_key", name="uq_seo_activity_event_key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    category_id: Mapped[str | None] = mapped_column(ForeignKey("activity_categories.id"), index=True)
+    page_id: Mapped[str | None] = mapped_column(ForeignKey("pages.id"), index=True)
+    import_batch_id: Mapped[str | None] = mapped_column(ForeignKey("import_batches.id"), index=True)
+    recommendation_id: Mapped[str | None] = mapped_column(ForeignKey("page_metadata_recommendations.id"), index=True)
+    issue_solution_id: Mapped[str | None] = mapped_column(ForeignKey("issue_solutions.id"), index=True)
+    related_activity_id: Mapped[str | None] = mapped_column(ForeignKey("seo_activities.id"), index=True)
+    event_key: Mapped[str] = mapped_column(String(512))
+    source: Mapped[str] = mapped_column(String(40), default="manual", index=True)
+    section: Mapped[str] = mapped_column(String(40), default="general", index=True)
+    action_type: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="in_progress", index=True)
+    title: Mapped[str] = mapped_column(String(500))
+    notes: Mapped[str | None] = mapped_column(Text)
+    url: Mapped[str | None] = mapped_column(String(4096))
+    issue_key: Mapped[str | None] = mapped_column(String(2048), index=True)
+    issue_type: Mapped[str | None] = mapped_column(String(255), index=True)
+    before_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    after_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    activity_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

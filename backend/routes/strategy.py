@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 from datetime import date, datetime, timezone
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
@@ -11,7 +12,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import CannibalizationCase, CaseDecision, GroupingSuggestion, Keyword, KeywordGroup, KeywordGroupMembership, KeywordMetricsSnapshot, Page, Project, ReviewHistory, TargetMapping
+from ..models import CannibalizationCase, CaseDecision, GA4PagePerformance, GSCQueryPagePerformance, GroupingSuggestion, Keyword, KeywordGroup, KeywordGroupMembership, KeywordMetricsSnapshot, Page, PageType, Project, ReviewHistory, TargetMapping
+from ..services.drafts import ensure_draft_page
 from ..services.keywords import normalize_phrase
 from ..services.strategy import generate_strategy_suggestions, scan_cannibalization, serialize_groups
 
@@ -66,6 +68,10 @@ class TargetUpdate(BaseModel):
     focus_keyword_id: str | None = None
 
 
+class DraftPageCreate(BaseModel):
+    url: str = Field(min_length=4, max_length=4096)
+
+
 class CaseDecisionInput(BaseModel):
     status: str
     action: str
@@ -98,6 +104,40 @@ def generate_suggestions(project_id: str, db: Session = Depends(get_db)):
 @router.get("/groups")
 def groups(project_id: str, db: Session = Depends(get_db)):
     return serialize_groups(db, project_or_404(db, project_id))
+
+
+@router.post("/draft-pages", status_code=201)
+def create_draft_page(project_id: str, payload: DraftPageCreate, db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id)
+    try:
+        page = ensure_draft_page(db, project, payload.url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if page.page_type != PageType.DRAFT.value:
+        raise HTTPException(409, "This URL already exists as a live page; select it as an existing target instead")
+    existing = db.scalar(select(TargetMapping).where(TargetMapping.project_id == project_id, TargetMapping.page_id == page.id))
+    if existing:
+        raise HTTPException(409, "This Draft URL is already listed in Page Mapping")
+    route = urlsplit(page.normalized_url).path or "/"
+    group = KeywordGroup(project_id=project_id, name=f"Draft · {route}", status="approved", rule_data={"method": "manual_draft_url"})
+    db.add(group)
+    db.flush()
+    mapping = TargetMapping(
+        project_id=project_id,
+        group_id=group.id,
+        page_id=page.id,
+        proposed_url=None,
+        planned_page=True,
+        planned_action="create_new",
+        status="approved",
+        reason_codes=["manual_draft_url"],
+        rationale="Draft page created from Page Mapping.",
+    )
+    db.add(mapping)
+    db.flush()
+    history(db, project_id, "target_mapping", mapping.id, "draft_page_created", {}, {"page_id": page.id, "url": page.original_url, "page_type": page.page_type, "planned_action": mapping.planned_action})
+    db.commit()
+    return {"page_id": page.id, "group_id": group.id, "mapping_id": mapping.id, "url": page.original_url, "page_type": page.page_type}
 
 
 @router.get("/groups/{group_id}/history")
@@ -271,6 +311,7 @@ def assign_manual_members(project_id: str, group_id: str, payload: ManualMembers
 
 @router.put("/groups/{group_id}/target")
 def set_target(project_id: str, group_id: str, payload: TargetUpdate, db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id)
     group = db.get(KeywordGroup, group_id)
     if not group or group.project_id != project_id:
         raise HTTPException(404, "Keyword group not found")
@@ -279,12 +320,16 @@ def set_target(project_id: str, group_id: str, payload: TargetUpdate, db: Sessio
     page = db.get(Page, payload.page_id) if payload.page_id else None
     if payload.page_id and (not page or page.project_id != project_id):
         raise HTTPException(422, "Selected page does not belong to this project")
-    planned_action = payload.planned_action or ("optimize_existing" if page else "create_new")
+    if page is None:
+        try:
+            page = ensure_draft_page(db, project, str(payload.proposed_url or ""))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    is_draft = page.page_type == PageType.DRAFT.value
+    planned_action = payload.planned_action or ("create_new" if is_draft else "optimize_existing")
     allowed_actions = {"create_new", "optimize_existing", "leave_as_is"}
     if planned_action not in allowed_actions:
         raise HTTPException(422, "Unsupported planned action")
-    if page is None and planned_action != "create_new":
-        raise HTTPException(422, "A proposed URL must use the Create new planned action")
     memberships = db.scalars(select(KeywordGroupMembership).where(KeywordGroupMembership.project_id == project_id, KeywordGroupMembership.group_id == group_id)).all()
     if payload.focus_keyword_id:
         focus = next((item for item in memberships if item.keyword_id == payload.focus_keyword_id), None)
@@ -298,23 +343,123 @@ def set_target(project_id: str, group_id: str, payload: TargetUpdate, db: Sessio
     if not mapping:
         mapping = TargetMapping(project_id=project_id, group_id=group_id)
         db.add(mapping); db.flush()
-    mapping.page_id = page.id if page else None
-    mapping.proposed_url = None if page else payload.proposed_url.strip()
-    mapping.planned_page = page is None
+    mapping.page_id = page.id
+    mapping.proposed_url = None
+    mapping.planned_page = is_draft
     mapping.planned_action = planned_action
     mapping.status = payload.status
     mapping.approved_by = payload.reviewer
-    mapping.rationale = payload.rationale or ("User-approved target page." if payload.status == "approved" else "User-selected target for review.")
+    default_rationale = (
+        "User-approved Draft target." if is_draft else "User-approved target page."
+    ) if payload.status == "approved" else "User-selected target for review."
+    mapping.rationale = payload.rationale or default_rationale
     mapping.reason_codes = ["manual_target_selection"]
     history(db, project_id, "target_mapping", mapping.id, "target_updated", before, {"page_id": mapping.page_id, "proposed_url": mapping.proposed_url, "status": mapping.status, "planned_action": mapping.planned_action, "focus_keyword_id": group.primary_keyword_id}, payload.reviewer, payload.rationale)
     db.commit()
-    return {"id": mapping.id, "status": mapping.status}
+    return {"id": mapping.id, "status": mapping.status, "page_id": page.id, "page_type": page.page_type}
 
 
-def serialize_case(db: Session, item: CannibalizationCase) -> dict:
+def _url_key(value: str | None) -> str:
+    raw = str(value or "").strip().rstrip("/").casefold()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    return f"{parsed.netloc}{parsed.path}".rstrip("/") if parsed.netloc else parsed.path.rstrip("/")
+
+
+def _presentation_context(db: Session, project_id: str) -> dict:
+    volumes: dict[str, int | None] = {}
+    for snapshot in db.scalars(select(KeywordMetricsSnapshot).where(KeywordMetricsSnapshot.project_id == project_id).order_by(KeywordMetricsSnapshot.observed_on.desc(), KeywordMetricsSnapshot.observed_at.desc())).all():
+        volumes.setdefault(snapshot.keyword_id, snapshot.volume)
+    gsc_by_page: dict[tuple[str, str], GSCQueryPagePerformance] = {}
+    gsc_by_url: dict[tuple[str, str], GSCQueryPagePerformance] = {}
+    for row in db.scalars(select(GSCQueryPagePerformance).where(GSCQueryPagePerformance.project_id == project_id, GSCQueryPagePerformance.aggregation_type == "query_page").order_by(GSCQueryPagePerformance.period_end.desc(), GSCQueryPagePerformance.observed_at.desc())).all():
+        if row.page_id:
+            gsc_by_page.setdefault((row.keyword_id, row.page_id), row)
+        if _url_key(row.page_url):
+            gsc_by_url.setdefault((row.keyword_id, _url_key(row.page_url)), row)
+    ga4_by_page: dict[str, GA4PagePerformance] = {}
+    ga4_by_url: dict[str, GA4PagePerformance] = {}
+    for row in db.scalars(select(GA4PagePerformance).where(GA4PagePerformance.project_id == project_id).order_by(GA4PagePerformance.period_end.desc(), GA4PagePerformance.observed_at.desc())).all():
+        if row.page_id:
+            ga4_by_page.setdefault(row.page_id, row)
+        if _url_key(row.normalized_url or row.landing_page):
+            ga4_by_url.setdefault(_url_key(row.normalized_url or row.landing_page), row)
+    return {"volumes": volumes, "gsc_by_page": gsc_by_page, "gsc_by_url": gsc_by_url, "ga4_by_page": ga4_by_page, "ga4_by_url": ga4_by_url}
+
+
+def _keyword_volume(db: Session, project_id: str, keyword_id: str | None, context: dict | None = None) -> int | None:
+    if not keyword_id:
+        return None
+    if context is not None:
+        return context["volumes"].get(keyword_id)
+    snapshot = db.scalar(select(KeywordMetricsSnapshot).where(KeywordMetricsSnapshot.project_id == project_id, KeywordMetricsSnapshot.keyword_id == keyword_id).order_by(KeywordMetricsSnapshot.observed_on.desc(), KeywordMetricsSnapshot.observed_at.desc()))
+    return snapshot.volume if snapshot else None
+
+
+def _url_performance(db: Session, project_id: str, keyword_id: str | None, raw: dict, context: dict | None = None) -> dict:
+    url = raw.get("url") or raw.get("ranking_url") or raw.get("target_url")
+    page_id = raw.get("page_id")
+    if context is None:
+        context = _presentation_context(db, project_id)
+    gsc = context["gsc_by_page"].get((keyword_id, page_id)) if keyword_id and page_id else None
+    gsc = gsc or (context["gsc_by_url"].get((keyword_id, _url_key(url))) if keyword_id and _url_key(url) else None)
+    ga4 = context["ga4_by_page"].get(page_id) if page_id else None
+    ga4 = ga4 or context["ga4_by_url"].get(_url_key(url))
+    return {
+        "url": url,
+        "page_id": page_id,
+        "page_type": raw.get("page_type"),
+        "position": raw.get("position"),
+        "approved_target": bool(raw.get("approved_target")),
+        "gsc_clicks": gsc.clicks if gsc else None,
+        "gsc_impressions": gsc.impressions if gsc else None,
+        "gsc_ctr": gsc.ctr if gsc else None,
+        "gsc_position": gsc.average_position if gsc else None,
+        "gsc_period_start": gsc.period_start if gsc else None,
+        "gsc_period_end": gsc.period_end if gsc else None,
+        "ga4_sessions": ga4.sessions if ga4 else None,
+        "ga4_engaged_sessions": ga4.engaged_sessions if ga4 else None,
+        "ga4_conversions": ga4.conversions if ga4 else None,
+        "ga4_period_start": ga4.period_start if ga4 else None,
+        "ga4_period_end": ga4.period_end if ga4 else None,
+        "ga4_channel_filter": ga4.channel_filter if ga4 else None,
+    }
+
+
+def _case_findings(db: Session, item: CannibalizationCase, context: dict) -> list[dict]:
+    classification = "keyword_overlap" if item.case_type == "approved_keyword_multi_target" or item.status == "harmless_overlap" else "potential_cannibalization"
+    if item.case_type in {"exact_query_multi_url", "approved_keyword_multi_target"}:
+        keyword = db.get(Keyword, item.keyword_id) if item.keyword_id else None
+        raw_urls = item.evidence.get("urls") if item.case_type == "exact_query_multi_url" else item.evidence.get("targets")
+        return [{
+            "keyword_id": item.keyword_id,
+            "keyword": keyword.text if keyword else item.title,
+            "search_volume": _keyword_volume(db, item.project_id, item.keyword_id, context),
+            "classification": classification,
+            "urls": [_url_performance(db, item.project_id, item.keyword_id, row, context) for row in (raw_urls or [])],
+        }]
+    if item.case_type == "ranking_target_mismatch":
+        approved = item.evidence.get("approved_target") or {}
+        grouped: dict[str, dict] = {}
+        for mismatch in item.evidence.get("mismatches") or []:
+            keyword_id = mismatch.get("keyword_id") or ""
+            entry = grouped.setdefault(keyword_id, {"keyword_id": keyword_id or None, "keyword": mismatch.get("keyword") or item.title, "rows": []})
+            entry["rows"].append({"url": mismatch.get("ranking_url"), "position": mismatch.get("position"), "page_id": mismatch.get("page_id"), "page_type": mismatch.get("page_type")})
+        findings = []
+        for entry in grouped.values():
+            target_row = {"url": approved.get("url"), "page_id": approved.get("page_id"), "page_type": approved.get("page_type"), "approved_target": True}
+            rows = ([target_row] if target_row["url"] else []) + entry["rows"]
+            findings.append({"keyword_id": entry["keyword_id"], "keyword": entry["keyword"], "search_volume": _keyword_volume(db, item.project_id, entry["keyword_id"], context), "classification": classification, "urls": [_url_performance(db, item.project_id, entry["keyword_id"], row, context) for row in rows]})
+        return findings
+    return []
+
+
+def serialize_case(db: Session, item: CannibalizationCase, context: dict | None = None) -> dict:
+    context = context or _presentation_context(db, item.project_id)
     decisions = db.scalars(select(CaseDecision).where(CaseDecision.case_id == item.id).order_by(CaseDecision.decided_at.desc())).all()
     reviews = db.scalars(select(ReviewHistory).where(ReviewHistory.entity_type == "cannibalization_case", ReviewHistory.entity_id == item.id).order_by(ReviewHistory.created_at.desc())).all()
-    return {"id": item.id, "case_key": item.case_key, "case_type": item.case_type, "keyword_id": item.keyword_id, "group_id": item.group_id, "status": item.status, "priority": item.priority, "title": item.title, "detected_at": item.detected_at, "last_seen_at": item.last_seen_at, "evidence": item.evidence, "unknowns": item.unknowns, "notes": item.notes, "latest_decision": None if not decisions else {"status": decisions[0].status, "action": decisions[0].action, "preferred_url": decisions[0].preferred_url, "reviewer": decisions[0].reviewer, "notes": decisions[0].notes, "decided_at": decisions[0].decided_at}, "decision_history": [{"id": decision.id, "status": decision.status, "action": decision.action, "preferred_url": decision.preferred_url, "reviewer": decision.reviewer, "notes": decision.notes, "decided_at": decision.decided_at} for decision in decisions], "review_history": [{"id": review.id, "action": review.action, "reviewer": review.reviewer, "reason": review.reason, "created_at": review.created_at} for review in reviews]}
+    return {"id": item.id, "case_key": item.case_key, "case_type": item.case_type, "keyword_id": item.keyword_id, "group_id": item.group_id, "status": item.status, "priority": item.priority, "title": item.title, "detected_at": item.detected_at, "last_seen_at": item.last_seen_at, "evidence": item.evidence, "unknowns": item.unknowns, "notes": item.notes, "findings": _case_findings(db, item, context), "latest_decision": None if not decisions else {"status": decisions[0].status, "action": decisions[0].action, "preferred_url": decisions[0].preferred_url, "reviewer": decisions[0].reviewer, "notes": decisions[0].notes, "decided_at": decisions[0].decided_at}, "decision_history": [{"id": decision.id, "status": decision.status, "action": decision.action, "preferred_url": decision.preferred_url, "reviewer": decision.reviewer, "notes": decision.notes, "decided_at": decision.decided_at} for decision in decisions], "review_history": [{"id": review.id, "action": review.action, "reviewer": review.reviewer, "reason": review.reason, "created_at": review.created_at} for review in reviews]}
 
 
 @router.post("/cannibalization/scan")
@@ -326,7 +471,8 @@ def scan(project_id: str, db: Session = Depends(get_db)):
 def list_cases(project_id: str, db: Session = Depends(get_db)):
     project_or_404(db, project_id)
     items = db.scalars(select(CannibalizationCase).where(CannibalizationCase.project_id == project_id).order_by(CannibalizationCase.last_seen_at.desc())).all()
-    return [serialize_case(db, item) for item in items]
+    context = _presentation_context(db, project_id)
+    return [serialize_case(db, item, context) for item in items]
 
 
 @router.post("/cannibalization/cases/{case_id}/decision")
@@ -367,11 +513,18 @@ def export_report(project_id: str, report: str, db: Session = Depends(get_db)):
                 writer.writerow({"Group": group["name"], "Intent": group["intent"], "Group Status": group["status"], "Keyword": member.get("keyword", ""), "Keyword Role": member.get("role", ""), "Membership Status": member.get("membership_status", ""), "Volume": member.get("volume", ""), "KD %": member.get("keyword_difficulty", ""), "Current Semrush Position": member.get("best_semrush_position", ""), "Observed Ranking URLs": " | ".join(member.get("ranking_urls", [])), "Target URL": target.get("url", ""), "Target Page Type": target.get("page_type", ""), "Target Status": target.get("status", ""), "Planned Page": target.get("planned_page", ""), "Planned Action": target.get("planned_action", ""), "Metadata Title": metadata.get("title", ""), "Metadata H1": " | ".join(h1 if isinstance(h1, list) else [str(h1)]), "Metadata Description": metadata.get("meta_description", ""), "Readiness": group["readiness"]})
     elif report in {"cannibalization", "review-queue"}:
         items = db.scalars(select(CannibalizationCase).where(CannibalizationCase.project_id == project_id).order_by(CannibalizationCase.last_seen_at.desc())).all()
-        fields = ["Case Type", "Title", "Priority", "Status", "Detected", "Last Seen", "Reason Codes", "Unknowns", "Proposed Action", "Preferred URL", "Reviewer", "Notes"]
+        context = _presentation_context(db, project_id)
+        fields = ["Keyword", "Issue Type", "Competing URLs", "Search Volume", "Total Clicks", "Total Impressions", "Top Position", "Case Type", "Title", "Priority", "Status", "Detected", "Last Seen", "Reason Codes", "Unknowns", "Proposed Action", "Preferred URL", "Reviewer", "Notes"]
         writer = csv.DictWriter(output, fieldnames=fields); writer.writeheader()
         for item in items:
-            detail = serialize_case(db, item); decision = detail["latest_decision"] or {}
-            writer.writerow({"Case Type": item.case_type, "Title": item.title, "Priority": item.priority, "Status": item.status, "Detected": item.detected_at, "Last Seen": item.last_seen_at, "Reason Codes": " | ".join(item.evidence.get("reason_codes", [])), "Unknowns": " | ".join(item.unknowns), "Proposed Action": decision.get("action", ""), "Preferred URL": decision.get("preferred_url", ""), "Reviewer": decision.get("reviewer", ""), "Notes": decision.get("notes", "")})
+            detail = serialize_case(db, item, context); decision = detail["latest_decision"] or {}
+            for finding in detail["findings"] or [{}]:
+                urls = finding.get("urls", [])
+                clicks = [row["gsc_clicks"] for row in urls if row.get("gsc_clicks") is not None]
+                impressions = [row["gsc_impressions"] for row in urls if row.get("gsc_impressions") is not None]
+                positions = [row.get("position") if row.get("position") is not None else row.get("gsc_position") for row in urls]
+                positions = [value for value in positions if value is not None]
+                writer.writerow({"Keyword": finding.get("keyword", ""), "Issue Type": finding.get("classification", ""), "Competing URLs": " | ".join(row.get("url") or "" for row in urls), "Search Volume": finding.get("search_volume", ""), "Total Clicks": sum(clicks) if clicks else "", "Total Impressions": sum(impressions) if impressions else "", "Top Position": min(positions) if positions else "", "Case Type": item.case_type, "Title": item.title, "Priority": item.priority, "Status": item.status, "Detected": item.detected_at, "Last Seen": item.last_seen_at, "Reason Codes": " | ".join(item.evidence.get("reason_codes", [])), "Unknowns": " | ".join(item.unknowns), "Proposed Action": decision.get("action", ""), "Preferred URL": decision.get("preferred_url", ""), "Reviewer": decision.get("reviewer", ""), "Notes": decision.get("notes", "")})
     else:
         raise HTTPException(404, "Unknown report")
     return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{report}.csv"'})

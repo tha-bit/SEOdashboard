@@ -286,6 +286,8 @@ https://shop.example.com/images/logo.svg,image/svg+xml,200,OK,Non-Indexable,Non-
     assert client.get(base, params={"indexability": "non_indexable"}).json()["total"] == 4
     assert client.get(base, params={"status_group": "redirect"}).json()["total"] == 1
     assert client.get(base, params={"imported_sitemap": "listed"}).json()["total"] == 3
+    assert client.get(base, params={"inclusions": "__filter_none__"}).json()["total"] == 0
+    assert client.get(base, params={"content_groups": "__filter_none__"}).json()["total"] == 0
     multi_content = client.get(base, params=[("content_groups", "html"), ("content_groups", "asset")]).json()
     assert multi_content["total"] == 5
     multi_status = client.get(base, params=[("status_groups", "ok"), ("status_groups", "redirect")]).json()
@@ -352,4 +354,30 @@ def test_hierarchy_svg_single_and_multi_map_exports_and_categorized_issue_csv(cl
     assert "architecture-issues.csv" in exported.headers["content-disposition"]
     rows = list(csv.DictReader(io.StringIO(exported.text)))
     assert rows
-    assert rows[0].keys() == {"Category", "Severity", "Issue Type", "Label", "URL", "Detail"}
+    assert set(rows[0]) == {
+        "Category", "Severity", "Issue Type", "Label", "URL", "Detail",
+        "Page Type", "Content Type", "Status Code", "Status", "Indexability",
+        "Indexability Status", "Proposed Sitemap", "Imported Sitemap Occurrences",
+        "Architecture Section", "Path Depth", "Hierarchy Depth", "Approved Parent URL",
+    }
+
+    individual = client.get(
+        f"/api/projects/{project['id']}/architecture/issues.csv",
+        params={"issue_type": "unknown_page_type", "severities": "warning", "search": "uncategorized"},
+    )
+    assert individual.status_code == 200
+    assert "architecture-unknown-page-type-issues.csv" in individual.headers["content-disposition"]
+    individual_rows = list(csv.DictReader(io.StringIO(individual.text)))
+    assert len(individual_rows) == 1
+    assert individual_rows[0]["Issue Type"] == "unknown_page_type"
+    assert individual_rows[0]["Severity"] == "warning"
+    assert individual_rows[0]["URL"].endswith("/uncategorized")
+    assert individual_rows[0]["Page Type"] == "Unknown"
+    assert individual_rows[0]["Path Depth"] == "1"
+
+    filtered_out = client.get(
+        f"/api/projects/{project['id']}/architecture/issues.csv",
+        params={"issue_type": "unknown_page_type", "severities": "error"},
+    )
+    assert filtered_out.status_code == 200
+    assert list(csv.DictReader(io.StringIO(filtered_out.text))) == []

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import date, datetime
+from collections import defaultdict
+from datetime import date, datetime, time, timezone
 from typing import Any
 from urllib.parse import urljoin
 
@@ -20,6 +21,8 @@ from ..models import (
     Page,
     Project,
     RankingObservation,
+    KeywordGroupMembership,
+    TargetMapping,
 )
 from .urls import normalize_url
 
@@ -67,10 +70,23 @@ KEYWORD_PRESETS: dict[str, dict[str, list[str]]] = {
 DEFAULT_WEIGHTS = {"traffic": 30.0, "intent": 30.0, "feasibility": 25.0, "relevance": 15.0}
 DEFAULT_INTENT_SCORES = {"transactional": 100.0, "commercial": 85.0, "mixed": 65.0, "informational": 35.0, "navigational": 25.0}
 DEFAULT_RANK_BANDS = {"winner": [1, 3], "quick_win": [4, 15], "striking_distance": [16, 30], "long_term": [31, None]}
+KNOWN_INTENTS = {"informational", "navigational", "commercial", "transactional"}
 
 
 def normalize_phrase(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def split_intents(value: Any) -> list[str]:
+    values = []
+    for raw in re.split(r"[,;|/]", str(value or "")):
+        normalized = raw.strip().casefold()
+        if not normalized:
+            continue
+        label = normalized.capitalize()
+        if label not in values:
+            values.append(label)
+    return values
 
 
 def suggested_keyword_mapping(columns: list[str], source: str) -> dict[str, str]:
@@ -224,8 +240,45 @@ def confirm_keyword_import(db: Session, batch: ImportBatch, project: Project, ma
         batch.warnings = [*batch.warnings, "Query-only GSC import: no ranking URL or query-to-page relationship was inferred."]
     if batch.source == "ga4" and not mapping.get("channel_filter"):
         batch.warnings = [*batch.warnings, "No channel filter was supplied; sessions are not labelled as organic."]
+    if batch.source in {"gsc", "ga4"}:
+        db.flush()
+        previous = db.scalar(select(ImportBatch).where(ImportBatch.project_id == project.id, ImportBatch.source == batch.source, ImportBatch.id != batch.id, ImportBatch.status.in_(["completed", "completed_with_errors"])).order_by(ImportBatch.imported_at.desc()).limit(1))
+        model = GSCQueryPagePerformance if batch.source == "gsc" else GA4PagePerformance
+        current_rows = list(db.scalars(select(model).where(model.import_batch_id == batch.id)))
+        previous_rows = list(db.scalars(select(model).where(model.import_batch_id == previous.id))) if previous else []
+        if batch.source == "gsc":
+            summarize = lambda items: {
+                "rows": len(items),
+                "clicks": sum(item.clicks or 0 for item in items),
+                "impressions": sum(item.impressions or 0 for item in items),
+                "average_position": _weighted_position(items),
+            }
+            title = "GSC performance data changed"
+        else:
+            summarize = lambda items: {
+                "rows": len(items),
+                "sessions": sum(item.sessions or 0 for item in items),
+                "engaged_sessions": sum(item.engaged_sessions or 0 for item in items),
+                "conversions": sum(item.conversions or 0 for item in items),
+            }
+            title = "GA4 landing-page data changed"
+        from .activity import add_activity
+        occurred_at = datetime.combine(batch.reporting_date, time.min, tzinfo=timezone.utc) if batch.reporting_date else batch.imported_at
+        add_activity(db, project.id, event_key=f"performance-import:{batch.source}:{batch.checksum}", source=batch.source, section="performance", action_type=f"{batch.source}_data_changed", status="changed", title=title, notes=f"Imported {batch.file_name}", import_batch_id=batch.id, before_data=summarize(previous_rows), after_data=summarize(current_rows), occurred_at=occurred_at, activity_metadata={"reporting_date": batch.reporting_date.isoformat() if batch.reporting_date else None})
+    elif batch.source == "semrush":
+        from .activity import add_activity
+        occurred_at = datetime.combine(batch.reporting_date, time.min, tzinfo=timezone.utc) if batch.reporting_date else batch.imported_at
+        add_activity(db, project.id, event_key=f"keyword-import:{batch.checksum}", source="semrush", section="keyword", action_type="keyword_data_imported", status="completed", title="Semrush keyword data imported", notes=f"Imported {batch.file_name}", import_batch_id=batch.id, after_data={"rows": imported, "errors": errors}, occurred_at=occurred_at)
     db.commit()
     return batch
+
+
+def _weighted_position(items) -> float | None:
+    weighted = [(item.average_position, item.impressions) for item in items if item.average_position is not None and item.impressions and item.impressions > 0]
+    values = [item.average_position for item in items if item.average_position is not None]
+    if weighted:
+        return sum(position * impressions for position, impressions in weighted) / sum(impressions for _, impressions in weighted)
+    return sum(values) / len(values) if values else None
 
 
 def score_settings(project: Project) -> dict[str, Any]:
@@ -251,8 +304,9 @@ def rank_band(position: float | None) -> str:
 def opportunity_components(keyword: Keyword, metric: KeywordMetricsSnapshot | None, position: float | None, max_volume: int, settings: dict[str, Any]) -> dict[str, Any]:
     volume = metric.volume if metric else None
     traffic = 100 * math.log1p(volume) / math.log1p(max_volume) if volume is not None and max_volume > 0 else (0.0 if volume == 0 else None)
-    intent_name = (metric.intent or "").strip().casefold() if metric else ""
-    intent = settings["intent_scores"].get(intent_name) if intent_name else None
+    intent_names = [item.casefold() for item in split_intents(metric.intent if metric else None)]
+    intent_values = [settings["intent_scores"][item] for item in intent_names if item in settings["intent_scores"]]
+    intent = max(intent_values) if intent_values else None
     difficulty = metric.keyword_difficulty if metric else None
     base = 55.0 if position is not None and position <= 3 else 95.0 if position is not None and position <= 15 else 80.0 if position is not None and position <= 30 else 55.0 if position is not None else 40.0
     feasibility = base if difficulty is None else 0.6 * base + 0.4 * max(0.0, min(100.0, 100.0 - difficulty))
@@ -300,6 +354,16 @@ def current_keyword_rows(db: Session, project: Project) -> list[dict[str, Any]]:
         max_volume_by_market[item.market] = max(max_volume_by_market.get(item.market, 0), item.volume or 0)
     settings = score_settings(project)
     pages = {page.id: page for page in db.scalars(select(Page).where(Page.project_id == project.id)).all()}
+    memberships = db.scalars(select(KeywordGroupMembership).where(KeywordGroupMembership.project_id == project.id)).all()
+    mappings = {item.group_id: item for item in db.scalars(select(TargetMapping).where(TargetMapping.project_id == project.id, TargetMapping.group_id.is_not(None))).all()}
+    mapped_urls: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for membership in memberships:
+        mapping = mappings.get(membership.group_id)
+        if not mapping:
+            continue
+        target_url = pages[mapping.page_id].original_url if mapping.page_id in pages else mapping.proposed_url
+        if target_url:
+            mapped_urls[membership.keyword_id][target_url].add(mapping.status)
     result = []
     for keyword in keywords:
         metric = latest_metric.get(keyword.id)
@@ -317,7 +381,24 @@ def current_keyword_rows(db: Session, project: Project) -> list[dict[str, Any]]:
                 urls.append(url)
             if item.page_id in pages and pages[item.page_id].page_type not in page_types:
                 page_types.append(pages[item.page_id].page_type)
+        associations: dict[str, dict[str, Any]] = {}
+        for item in rank_items:
+            url = item.ranking_url or (pages[item.page_id].original_url if item.page_id in pages else None)
+            if url:
+                association = associations.setdefault(url, {"url": url, "semrush": False, "gsc": False, "mapped": False, "mapping_statuses": []})
+                association["semrush"] = True
+        for item in gsc_items:
+            url = item.page_url or (pages[item.page_id].original_url if item.page_id in pages else None)
+            if url:
+                association = associations.setdefault(url, {"url": url, "semrush": False, "gsc": False, "mapped": False, "mapping_statuses": []})
+                association["gsc"] = True
+        for url, statuses in mapped_urls.get(keyword.id, {}).items():
+            association = associations.setdefault(url, {"url": url, "semrush": False, "gsc": False, "mapped": False, "mapping_statuses": []})
+            association["mapped"] = True
+            association["mapping_statuses"] = sorted(statuses)
+        association_rows = sorted(associations.values(), key=lambda item: (not item["mapped"], item["url"]))
+        assigned_urls = sorted(mapped_urls.get(keyword.id, {}))
         comparable_market = metric.market if metric else keyword.market
         score = opportunity_components(keyword, metric, best_position, max_volume_by_market.get(comparable_market, 0), settings)
-        result.append({"id": keyword.id, "keyword": keyword.text, "market": keyword.market, "language": keyword.language, "volume": metric.volume if metric else None, "keyword_difficulty": metric.keyword_difficulty if metric else None, "intent": metric.intent if metric else None, "metric_date": metric.observed_on if metric else None, "best_semrush_position": best_position, "rank_date": latest_rank_scope.get(keyword.id, (None, None))[0], "rank_band": score["rank_band"], "ranking_urls": urls, "ranking_url_count": len(urls), "ranking_page_types": page_types, "gsc_clicks": clicks, "gsc_impressions": impressions, "gsc_scope": latest_gsc_scope.get(keyword.id, (None, None, None))[0], "product_relevance": keyword.product_relevance, "relevance_status": keyword.relevance_status, "opportunity": score})
+        result.append({"id": keyword.id, "keyword": keyword.text, "market": keyword.market, "language": keyword.language, "volume": metric.volume if metric else None, "keyword_difficulty": metric.keyword_difficulty if metric else None, "intent": metric.intent if metric else None, "intents": split_intents(metric.intent if metric else None), "metric_date": metric.observed_on if metric else None, "best_semrush_position": best_position, "rank_date": latest_rank_scope.get(keyword.id, (None, None))[0], "rank_band": score["rank_band"], "ranking_urls": urls, "ranking_url_count": len(urls), "ranking_page_types": page_types, "assigned_urls": assigned_urls, "assigned_url_count": len(assigned_urls), "url_associations": association_rows, "associated_url_count": len(association_rows), "gsc_clicks": clicks, "gsc_impressions": impressions, "gsc_scope": latest_gsc_scope.get(keyword.id, (None, None, None))[0], "product_relevance": keyword.product_relevance, "relevance_status": keyword.relevance_status, "opportunity": score})
     return result

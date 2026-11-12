@@ -89,6 +89,8 @@ def test_page_type_assignment_filters_and_retired_product_pages_label(client, pr
     unassigned = client.get(f"/api/projects/{project['id']}/pages?classification=unassigned").json()
     assert unassigned["total"] == 1
     assert unassigned["items"][0]["id"] == unknown["id"]
+    assert client.get(f"/api/projects/{project['id']}/pages?classification=__filter_none__").json()["total"] == 0
+    assert client.get(f"/api/projects/{project['id']}/pages", params={"page_types": "__filter_none__"}).json()["total"] == 0
 
     typed = client.get(f"/api/projects/{project['id']}/pages?page_type=PDP").json()
     assert typed["total"] == 1
