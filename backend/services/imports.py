@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import ImportBatch, ImportRow, Page, PageCrawlChange, PageMetadataObservation, PageType, Project
+from .cache import invalidate_project_cache
 from .drafts import is_successful_html, mark_draft_live, materialize_legacy_draft_targets
 from .screaming_frog import SCREAMING_FROG_INLINK_FIELDS, recognize_headers, semantic_field_options, suggested_semantic_mapping
 from .page_types import is_obvious_asset
@@ -187,6 +188,7 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
         raise HTTPException(422, "Map a source column to URL before importing")
     materialize_legacy_draft_targets(db, project)
     rows = db.scalars(select(ImportRow).where(ImportRow.batch_id == batch.id).order_by(ImportRow.row_number)).all()
+    existing_pages = {p.normalized_url: p for p in db.scalars(select(Page).where(Page.project_id == project.id))}
     imported = skipped = errors = 0
     seen: set[str] = set()
     batch.mapping = mapping
@@ -221,7 +223,7 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
             skipped += 1
             continue
         seen.add(normalized)
-        page = db.scalar(select(Page).where(Page.project_id == project.id, Page.normalized_url == normalized))
+        page = existing_pages.get(normalized)
         if page:
             promotes_draft = (
                 page.page_type == PageType.DRAFT.value
@@ -243,13 +245,30 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
                 "mapping": mapping,
             }
             crawl_changes = {}
+            overrides = page.manual_overrides or {}
             for field_name, label in CRAWL_PAGE_FIELDS.items():
                 new_value = values[field_name]
                 if not mapping.get(field_name) or new_value is None:
                     continue
                 old_value = getattr(page, field_name)
-                if old_value != new_value:
-                    crawl_changes[field_name] = {"label": label, "from": old_value, "to": new_value}
+                manual_override = overrides.get(field_name)
+                contradicts = False
+                if manual_override is not None and manual_override != "":
+                    if field_name == "http_status":
+                        try:
+                            contradicts = int(manual_override) != int(new_value)
+                        except (ValueError, TypeError):
+                            contradicts = str(manual_override) != str(new_value)
+                    else:
+                        contradicts = str(manual_override).strip().casefold() != str(new_value).strip().casefold()
+
+                if old_value != new_value or contradicts:
+                    entry = {"label": label, "from": old_value, "to": new_value}
+                    if contradicts:
+                        entry["contradicts_manual_override"] = True
+                        entry["manual_override_value"] = manual_override
+                        entry["discrepancy"] = f"Crawl observed '{new_value}', contradicting manual override '{manual_override}'."
+                    crawl_changes[field_name] = entry
                     setattr(page, field_name, new_value)
             page.last_observed_at = datetime.now(timezone.utc)
             page.source = batch.source
@@ -287,6 +306,7 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
             }
             db.add(page)
             db.flush()
+            existing_pages[normalized] = page
             row.validation_status = "imported"
         row.page_id = page.id
         if supplied_fields:
@@ -308,8 +328,10 @@ def confirm_import(db: Session, batch: ImportBatch, project: Project, mapping: d
     batch.status = "completed_with_errors" if errors else "completed"
     if errors:
         batch.warnings = [*batch.warnings, f"{errors} row(s) were not imported. Review the row-level errors."]
+    invalidate_project_cache(project.id)
     if batch.source == "screaming_frog":
         from .activity import record_issue_snapshot
         record_issue_snapshot(db, project, batch)
     db.commit()
+    invalidate_project_cache(project.id)
     return batch

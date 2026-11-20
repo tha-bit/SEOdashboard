@@ -43,6 +43,43 @@ def page_signals(page, snapshot: dict | None = None, imported_sitemap_count: int
             canonical_status = "canonical" if normalize_url(str(canonical), preferences or {}) == page.normalized_url else "non_canonical"
         except ValueError:
             canonical_status = "invalid"
+
+    observed_map = {
+        "http_status": page.http_status,
+        "http_status_text": page.http_status_text,
+        "indexability": page.indexability,
+        "indexability_status": page.indexability_status,
+        "content_type": page.content_type,
+        "canonical_url": current.get("canonical_url") or recognized.get("canonical_url"),
+        "redirect_uri": recognized.get("redirect_uri"),
+        "redirect_type": recognized.get("redirect_type"),
+        "sitemap_included": page.sitemap_included,
+    }
+    discrepancies = []
+    for field, manual_val in (page.manual_overrides or {}).items():
+        if field.startswith("_") or manual_val is None or manual_val == "":
+            continue
+        observed_val = observed_map.get(field)
+        if observed_val is None or observed_val == "":
+            continue
+        is_conflict = False
+        if field == "http_status":
+            try:
+                is_conflict = int(manual_val) != int(observed_val)
+            except (ValueError, TypeError):
+                is_conflict = str(manual_val) != str(observed_val)
+        elif field == "sitemap_included":
+            is_conflict = manual_val != observed_val
+        else:
+            is_conflict = str(manual_val).strip().casefold() != str(observed_val).strip().casefold()
+        if is_conflict:
+            discrepancies.append({
+                "field": field,
+                "manual_value": manual_val,
+                "crawl_value": observed_val,
+                "message": f"Manual override ({manual_val}) contradicts latest crawl ({observed_val}).",
+            })
+
     return {
         "http_status": status,
         "http_status_text": override_value(page, "http_status_text", page.http_status_text),
@@ -62,6 +99,8 @@ def page_signals(page, snapshot: dict | None = None, imported_sitemap_count: int
         "is_html": is_html,
         "on_page_eligible": page.page_type == "Draft" or (is_html and (status is None or int(status) == 200)),
         "manual_fields": sorted((page.manual_overrides or {}).keys()),
+        "has_discrepancy": len(discrepancies) > 0,
+        "discrepancies": discrepancies,
     }
 
 

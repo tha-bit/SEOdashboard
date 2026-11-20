@@ -129,3 +129,48 @@
 .column-picker .filter-option-row input[type=checkbox],.architecture-inventory-panel .column-picker>div>label input[type=checkbox]{width:16px!important;min-width:16px!important;height:16px!important;margin:0!important;padding:0!important}
 .column-picker .filter-option-row span,.architecture-inventory-panel .column-picker>div>label span{display:block!important;min-width:0!important;margin:0!important;padding:0!important;text-align:left!important;line-height:1.35!important}
 .architecture-inventory-panel,.architecture-inventory-panel>.workspace-filter-bar{overflow:visible;min-width:0}
+
+
+/* Priority Management - Issue Enable/Disable Toggle */
+.issue-toggle-btn{display:inline-flex;align-items:center;justify-content:center;padding:4px 10px;border-radius:14px;font-size:.75rem;font-weight:700;cursor:pointer;border:1px solid transparent;transition:all .15s ease}
+.issue-toggle-btn.enabled{background:#e6f4ea;color:#137333;border-color:#ceead6}
+.issue-toggle-btn.enabled:hover{background:#ceead6;border-color:#34a853}
+.issue-toggle-btn.disabled{background:#f1f3f4;color:#5f6368;border-color:#dadce0}
+.issue-toggle-btn.disabled:hover{background:#e8eaed;color:#202124}
+.disabled-issue-row{opacity:.55;background:#fafafa}
+.disabled-issue-row td strong{color:#5f6368}
+.inline-toggle{display:inline-flex;align-items:center;gap:6px;font-size:.85rem;color:var(--ink);cursor:pointer;user-select:none;margin-left:8px}
+.inline-toggle input{accent-color:#137333;cursor:pointer}
+
+/* Internal Linking - Affected Links in Drawer */
+.count-chip{display:inline-flex;align-items:center;padding:2px 8px;border-radius:12px;background:#e8f0fe;color:#1a73e8;font-size:.75rem;font-weight:700;white-space:nowrap}
+.affected-links-section{margin-top:14px}
+.affected-links-header h3{font-size:.95rem;margin:0 0 4px}
+.affected-links-header p{color:var(--muted);font-size:.8rem;margin:0 0 10px}
+.affected-links-list{display:grid;gap:10px;max-height:420px;overflow-y:auto;padding-right:4px}
+.affected-link-row{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#fdfdfd;display:grid;gap:8px}
+.affected-link-urls{display:grid;gap:5px;font-size:.82rem}
+.affected-link-urls a{color:#1a73e8;text-decoration:none;word-break:break-all;font-weight:600}
+.affected-link-urls a:hover{text-decoration:underline}
+.link-label{display:block;font-size:.7rem;text-transform:uppercase;color:var(--muted);font-weight:700;letter-spacing:.03em;margin-bottom:2px}
+.affected-link-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:6px 12px;margin:0;padding-top:6px;border-top:1px solid #edf0ee;font-size:.78rem}
+.affected-link-meta dt{color:var(--muted);font-size:.7rem;text-transform:capitalize}
+.affected-link-meta dd{margin:0;font-weight:600;color:var(--ink);word-break:break-all}
+.status-pill{display:inline-flex;align-items:center;padding:2px 7px;border-radius:6px;font-size:.75rem;font-weight:700}
+.status-pill.error{background:#fce8e6;color:#c5221f}
+.status-pill.redirect{background:#fef7e0;color:#b06000}
+.status-pill.ok{background:#e6f4ea;color:#137333}
+.show-more-links{margin-top:8px;font-size:.82rem;color:#1a73e8;cursor:pointer;background:none;border:none;padding:4px 0;text-decoration:underline}
+
+/* Pagination Rows per page & controls */
+.pages-pagesize-control{display:flex;align-items:center;gap:8px;margin-left:auto;white-space:nowrap}
+.pages-pagesize-control label{font-size:11px;font-weight:700;color:#6f7c77}
+.pages-pagesize-control select{border:1px solid #d7ddd9;border-radius:7px;padding:7px 10px;background:#fff;color:#43514c;font-size:12px;font-weight:600}
+.pages-pagesize-control select:focus{outline:none;border-color:#5a8f80;box-shadow:0 0 0 3px #e2efea}
+.pagination-pagesize{display:flex;align-items:center;gap:8px;margin-right:auto}
+.pagination-pagesize label{font-size:11px;color:#6f7c77}
+.pagination-pagesize select{border:1px solid var(--line);border-radius:6px;background:#fff;padding:4px 8px;font-size:11px;color:#43514c}
+.pagination-controls{display:flex;align-items:center;gap:12px}
+.issue-pages-more{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:#f9faf8;border-top:1px solid #edf0ed;font-size:11px;color:var(--muted)}
+@media(max-width:760px){.pages-search-row{flex-wrap:wrap}.pages-pagesize-control{margin-left:0;width:100%;justify-content:flex-end}}
+

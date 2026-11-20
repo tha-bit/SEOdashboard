@@ -13,8 +13,8 @@ type IssueSeverity='error'|'warning'|'info'
 type IssueView='issues'|'solutions'|'priorities'
 type SolutionStage='proposed'|'ignored'|'in_progress'|'implemented'|'verified'
 type IssueSolution={id:string;project_id:string;page_id?:string;issue_key:string;source:Exclude<IssueSource,'all'>;issue_type:string;issue_label:string;workflow_status:SolutionStage;action:string;summary:string;owner?:string;target_date?:string;verification_notes?:string;issue_snapshot:Record<string,unknown>;data:Record<string,unknown>;created_at:string}
-type UnifiedIssue={issue_key:string;source:Exclude<IssueSource,'all'>;source_label:string;source_severity:string;category:string;severity:IssueSeverity;priority:IssuePriority;status:string;type:string;page_id?:string;url?:string;label:string;detail:string;solution_count:number;latest_solution?:IssueSolution}
-type PrioritySetting={source:Exclude<IssueSource,'all'>;type:string;label:string;category:string;default_priority:IssuePriority;priority:IssuePriority;customized:boolean;detected_count:number}
+type UnifiedIssue={issue_key:string;source:Exclude<IssueSource,'all'>;source_label:string;source_severity:string;category:string;severity:IssueSeverity;priority:IssuePriority;status:string;type:string;page_id?:string;url?:string;label:string;detail:string;solution_count:number;latest_solution?:IssueSolution;recommendation?:string;recommended_solution?:string;page_type?:string;content_type?:string;http_status?:number|string;http_status_text?:string;indexability?:string;indexability_status?:string;canonical_url?:string;canonical_status?:string;redirect_uri?:string;redirect_type?:string;sitemap_included?:boolean|null;in_imported_sitemap?:boolean;imported_sitemap_occurrences?:number;sitemap_name?:string;source_url?:string;destination_url?:string;anchor?:string;link_position?:string;affected_link_count?:number;evidence?:Record<string,unknown>}
+type PrioritySetting={source:Exclude<IssueSource,'all'>;type:string;label:string;category:string;default_priority:IssuePriority;priority:IssuePriority;customized:boolean;detected_count:number;disabled:boolean}
 type OnPageEvidence={current:Record<string,unknown>;field_states:Record<string,string>;last_observed_at?:string}
 
 const categoryOrder=['Broken & Invalid Links','Orphan & Weakly Linked Pages','Architecture & Crawl Depth','Anchor Text Issues','Indexability & Canonical Conflicts','Internal Linking Opportunities','Link Distribution & Structural Patterns','Technical SEO','Sitemap','Hierarchy','Page classification','Inventory evidence','Content metadata','Canonical & robots','Hreflang','Metadata evidence']
@@ -51,7 +51,8 @@ export function Issues({project}:{project:Project}){
   function saved(){setSelectedIssue(undefined);setRefresh(value=>value+1)}
   async function changePriority(issue:UnifiedIssue,priority:string){try{await patchJson(`/api/projects/${project.id}/issues/${encodeURIComponent(issue.issue_key)}/priority`,{priority:priority==='automatic'?null:priority});setRefresh(value=>value+1)}catch(err){setError((err as Error).message)}}
   async function createTask(issue:UnifiedIssue){try{const result=await postJson<{duplicate?:boolean}>(`/api/projects/${project.id}/task-manager/tasks`,{title:issue.label,description:issue.detail,category:issue.category,priority:issue.priority,status:'to_do',related_urls:issue.url?[issue.url]:[],supporting_links:[],source_issue_key:issue.issue_key,source_issue_type:issue.type,source_section:issue.source,source_url:issue.url||null});window.alert(result.duplicate?'An open task is already linked to this issue.':'Task added to Task Manager.')}catch(err){setError((err as Error).message)}}
-  return <div className="page issues-page"><div className="page-heading compact"><div><p className="eyebrow">CENTRAL REVIEW & SOLUTION LOG</p><h1>Issues</h1><p>Review findings, record source-specific solutions, and retain implementation evidence for reporting.</p></div><div className="actions"><a className="secondary button" href={`/api/projects/${project.id}/issue-solutions.csv`}><Icon name="download"/>Solution log CSV</a><a className="primary button" href={`/api/projects/${project.id}/issues.csv`}><Icon name="download"/>Issues CSV</a></div></div>
+  function allIssuesExportUrl(){const params=new URLSearchParams();if(source!=='all')params.set('source',source);if(search.trim())params.set('search',search.trim());selectedCategories.forEach(item=>params.append('categories',item));selectedPriorities.forEach(item=>params.append('priorities',item));return `/api/projects/${project.id}/issues.csv?${params}`}
+  return <div className="page issues-page"><div className="page-heading compact"><div><p className="eyebrow">CENTRAL REVIEW & SOLUTION LOG</p><h1>Issues</h1><p>Review findings, record source-specific solutions, and retain implementation evidence for reporting.</p></div><div className="actions"><a className="secondary button" href={`/api/projects/${project.id}/issue-solutions.csv`}><Icon name="download"/>Solution log CSV</a><a className="primary button" href={allIssuesExportUrl()}><Icon name="download"/>Issues CSV</a></div></div>
     <div className="tabs issue-view-tabs" role="tablist"><button role="tab" aria-selected={view==='issues'} className={view==='issues'?'active':''} onClick={()=>setView('issues')}>Current issues <span>{issues.length.toLocaleString()}</span></button><button role="tab" aria-selected={view==='solutions'} className={view==='solutions'?'active':''} onClick={()=>setView('solutions')}>Solution log <span>{solutions.length.toLocaleString()}</span></button><button role="tab" aria-selected={view==='priorities'} className={view==='priorities'?'active':''} onClick={()=>setView('priorities')}>Priority Management <span>{prioritySettings.length.toLocaleString()}</span></button></div>
     <div className="tabs issue-source-tabs" role="tablist">{sourceTabs.map(tab=>{const items=view==='issues'?issues:view==='solutions'?solutions:prioritySettings;const tabCount=items.filter(item=>tab.value==='all'||item.source===tab.value).length;return <button key={tab.value} role="tab" aria-selected={source===tab.value} className={source===tab.value?'active':''} onClick={()=>changeSource(tab.value)}>{tab.label}<span>{tabCount.toLocaleString()}</span></button>})}</div>
     {view==='issues'?<><section className="metric-grid issue-metrics"><SummaryActionCard label="Critical" value={count('critical').toLocaleString()} detail="Immediate attention recommended" action={selectedPriorities.length===1&&selectedPriorities[0]==='critical'?'Clear filter':'Show critical'} active={selectedPriorities.length===1&&selectedPriorities[0]==='critical'} attention={count('critical')>0} onClick={()=>filterPriority('critical')}/><SummaryActionCard label="High" value={count('high').toLocaleString()} detail="High-impact review items" action={selectedPriorities.length===1&&selectedPriorities[0]==='high'?'Clear filter':'Show high'} active={selectedPriorities.length===1&&selectedPriorities[0]==='high'} attention={count('high')>0} onClick={()=>filterPriority('high')}/><SummaryActionCard label="Medium" value={count('medium').toLocaleString()} detail="Planned review work" action={selectedPriorities.length===1&&selectedPriorities[0]==='medium'?'Clear filter':'Show medium'} active={selectedPriorities.length===1&&selectedPriorities[0]==='medium'} onClick={()=>filterPriority('medium')}/><SummaryActionCard label="Low" value={count('low').toLocaleString()} detail="Lower-impact observations" action={selectedPriorities.length===1&&selectedPriorities[0]==='low'?'Clear filter':'Show low'} active={selectedPriorities.length===1&&selectedPriorities[0]==='low'} onClick={()=>filterPriority('low')}/></section>
@@ -65,29 +66,213 @@ export function Issues({project}:{project:Project}){
 
 function IssueCategory({category,issues,onSolution,onPage,onPriority,onTask}:{category:string;issues:UnifiedIssue[];onSolution:(issue:UnifiedIssue)=>void;onPage:(issue:UnifiedIssue)=>void;onPriority:(issue:UnifiedIssue,priority:string)=>void;onTask:(issue:UnifiedIssue)=>void}){
   const groups=useMemo(()=>{const map=new Map<string,{label:string;severity:IssueSeverity;source:UnifiedIssue['source'];sourceLabel:string;sourceSeverity:string;items:UnifiedIssue[]}>();const order={error:0,warning:1,info:2};for(const issue of issues){const key=`${issue.source}:${issue.type}`;const current=map.get(key);if(current)current.items.push(issue);else map.set(key,{label:issue.label,severity:issue.severity,source:issue.source,sourceLabel:issue.source_label,sourceSeverity:issue.source_severity,items:[issue]})}return [...map.entries()].sort((a,b)=>order[a[1].severity]-order[b[1].severity]||b[1].items.length-a[1].items.length)},[issues])
-  function download(label:string,items:UnifiedIssue[]){downloadCsv(`${category}-${label}`,items.map(issue=>({Source:issue.source_label,Category:issue.category,'Issue Type':issue.type,Issue:issue.label,Priority:issue.priority,Status:issue.status,URL:issue.url||'','Page ID':issue.page_id||'',Detail:issue.detail,'Solution Log Entries':issue.solution_count})))}
+  function download(label:string,items:UnifiedIssue[]){
+    const isStatus = category === 'Technical SEO' || items.some(i => i.type.startsWith('http_') || i.type.startsWith('redirect_'))
+    const isSitemapOrCanonical = category === 'Sitemap' || category === 'Canonical & robots' || items.some(i => i.type.startsWith('sitemap_') || i.type.startsWith('canonical_') || i.type.startsWith('robots_'))
+    const isInternalLink = category.includes('Links') || category.includes('Linking') || items.some(i => Boolean(i.source_url || i.destination_url || i.anchor || (i.evidence && 'source_url' in i.evidence)))
+
+    const rows = items.map(issue => {
+      const ev = issue.evidence || {}
+      if (isInternalLink) {
+        return {
+          'Source URL': issue.source_url || (ev.source_url as string) || '',
+          'Destination URL': issue.destination_url || (ev.destination_url as string) || issue.url || '',
+          'HTTP Status Code': issue.http_status ?? (ev.status_code as number) ?? '',
+          'Anchor Text': issue.anchor || (ev.anchor as string) || '',
+          'Link Position': issue.link_position || (ev.link_position as string) || '',
+          'Indexability': issue.indexability || '',
+          'Canonical Status': issue.canonical_status || '',
+          'Canonical URL': issue.canonical_url || '',
+          'Page Type': issue.page_type || '',
+          'Affected Link Count': issue.affected_link_count ?? (ev.affected_link_count as number) ?? '',
+          'Issue': issue.label,
+          'Priority': issue.priority,
+          'Status': issue.status,
+          'Detail': issue.detail,
+          'Recommendation': issue.recommendation || issue.recommended_solution || '',
+        }
+      }
+      if (isStatus) {
+        return {
+          'Affected URL': issue.url || '',
+          'HTTP Status Code': issue.http_status ?? '',
+          'Status': issue.http_status_text || '',
+          'Content Type': issue.content_type || '',
+          'Page Type': issue.page_type || '',
+          'Redirect Destination': issue.redirect_uri || '',
+          'Redirect Type': issue.redirect_type || '',
+          'Issue': issue.label,
+          'Priority': issue.priority,
+          'Workflow Status': issue.status,
+          'Detail': issue.detail,
+          'Recommendation': issue.recommendation || issue.recommended_solution || '',
+        }
+      }
+      if (isSitemapOrCanonical) {
+        return {
+          'Affected URL': issue.url || '',
+          'Sitemap URL or Name': issue.sitemap_name || (issue.sitemap_included === true ? 'Proposed Sitemap' : issue.in_imported_sitemap ? 'Imported Sitemap' : ''),
+          'Indexability': issue.indexability || '',
+          'Indexability Status': issue.indexability_status || '',
+          'Canonical URL': issue.canonical_url || '',
+          'Canonical Status': issue.canonical_status || '',
+          'Content Type': issue.content_type || '',
+          'Page Type': issue.page_type || '',
+          'Proposed Sitemap': issue.sitemap_included === true ? 'Included' : issue.sitemap_included === false ? 'Excluded' : issue.page_type ? 'Unreviewed' : '',
+          'Imported Sitemap Occurrences': issue.imported_sitemap_occurrences ?? '',
+          'Issue': issue.label,
+          'Priority': issue.priority,
+          'Status': issue.status,
+          'Detail': issue.detail,
+          'Recommendation': issue.recommendation || issue.recommended_solution || '',
+        }
+      }
+      return {
+        'Affected URL': issue.url || '',
+        'Issue': issue.label,
+        'Category': issue.category,
+        'Priority': issue.priority,
+        'Status': issue.status,
+        'Page Type': issue.page_type || '',
+        'Content Type': issue.content_type || '',
+        'HTTP Status Code': issue.http_status ?? '',
+        'Indexability': issue.indexability || '',
+        'Canonical URL': issue.canonical_url || '',
+        'Detail': issue.detail,
+        'Recommendation': issue.recommendation || issue.recommended_solution || '',
+        'Solution Log Entries': issue.solution_count,
+      }
+    })
+    downloadCsv(`${category}-${label}`, rows)
+  }
   return <section className="issue-category">
     <header><div><p className="eyebrow">{category.toUpperCase()}</p><h2>{category}</h2><p>{categoryNotes[category]||'Issues grouped by source and rule.'}</p></div><span className="count-chip">{issues.length.toLocaleString()}</span></header>
-    <div className="issue-groups">{groups.map(([key,group],index)=><details className={`issue-group ${group.severity}`} key={key} open={index===0}>
-      <summary><span className="severity-dot"/><div><strong>{group.label}</strong><small><span className={`issue-source-badge ${group.source}`}>{group.sourceLabel}</span>{key.split(':').slice(1).join(':').replaceAll('_',' ')} · {group.sourceSeverity}</small></div><b>{group.items.length.toLocaleString()}</b><span className="disclosure">⌄</span></summary>
-      <div className="issue-group-tools"><button className="secondary compact-button" onClick={()=>download(group.label,group.items)}><Icon name="download"/>Download this issue CSV</button></div>
-      <div className="issue-pages">{group.items.map((issue,itemIndex)=><article key={`${issue.issue_key}-${itemIndex}`}>
-        <div>{issue.url&&issue.page_id?<button className="issue-url-button" onClick={()=>onPage(issue)}><strong>{shortRoute(issue.url)}</strong><small>{issue.url}</small><span>View page details →</span></button>:<strong>{issue.url?shortRoute(issue.url):'Project-level issue'}</strong>}{issue.url&&!issue.page_id&&<small>{issue.url}</small>}{issue.latest_solution&&<span className={`solution-stage ${issue.latest_solution.workflow_status}`}>{stageLabels[issue.latest_solution.workflow_status]} · {issue.solution_count} log{issue.solution_count===1?'':'s'}</span>}</div>
-        <p>{issue.detail}</p><div className="issue-item-actions"><button className="secondary compact-button" onClick={()=>onSolution(issue)}>{issue.solution_count?'View / update solution':'View solution'}</button><button className="secondary compact-button" onClick={()=>onTask(issue)}>Create task</button><label className="priority-control">Priority<select value={issue.priority} onChange={event=>onPriority(issue,event.target.value)}><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="automatic">Automatic</option></select></label><Link className="issue-source-link" to={`/activity?issue_key=${encodeURIComponent(issue.issue_key)}`}>Activity →</Link><Link className="issue-source-link" to={sourceRoute(issue)}>Open source →</Link></div>
-      </article>)}</div>
-    </details>)}</div>
+    <div className="issue-groups">{groups.map(([key,group],index)=><IssueGroupCard
+      key={key}
+      groupKey={key}
+      group={group}
+      index={index}
+      onDownload={()=>download(group.label,group.items)}
+      onPage={onPage}
+      onSolution={onSolution}
+      onTask={onTask}
+      onPriority={onPriority}
+    />)}</div>
   </section>
+}
+
+function IssueGroupCard({
+  groupKey,
+  group,
+  index,
+  onDownload,
+  onPage,
+  onSolution,
+  onTask,
+  onPriority,
+}: {
+  groupKey: string
+  group: { label: string; severity: IssueSeverity; source: UnifiedIssue['source']; sourceLabel: string; sourceSeverity: string; items: UnifiedIssue[] }
+  index: number
+  onDownload: () => void
+  onPage: (issue: UnifiedIssue) => void
+  onSolution: (issue: UnifiedIssue) => void
+  onTask: (issue: UnifiedIssue) => void
+  onPriority: (issue: UnifiedIssue, priority: string) => void
+}) {
+  const [visibleCount, setVisibleCount] = useState(50)
+  const visibleItems = group.items.slice(0, visibleCount)
+
+  return (
+    <details className={`issue-group ${group.severity}`} open={index === 0}>
+      <summary>
+        <span className="severity-dot" />
+        <div>
+          <strong>{group.label}</strong>
+          <small>
+            <span className={`issue-source-badge ${group.source}`}>{group.sourceLabel}</span>
+            {groupKey.split(':').slice(1).join(':').replaceAll('_', ' ')} · {group.sourceSeverity}
+          </small>
+        </div>
+        <b>{group.items.length.toLocaleString()}</b>
+        <span className="disclosure">⌄</span>
+      </summary>
+      <div className="issue-group-tools">
+        <button className="secondary compact-button" onClick={onDownload}>
+          <Icon name="download" />Download this issue CSV
+        </button>
+      </div>
+      <div className="issue-pages">
+        {visibleItems.map((issue, itemIndex) => (
+          <article key={`${issue.issue_key}-${itemIndex}`}>
+            <div>
+              {issue.url && issue.page_id ? (
+                <button className="issue-url-button" onClick={() => onPage(issue)}>
+                  <strong>{shortRoute(issue.url)}</strong>
+                  <small>{issue.url}</small>
+                  <span>View page details →</span>
+                </button>
+              ) : (
+                <strong>{issue.url ? shortRoute(issue.url) : 'Project-level issue'}</strong>
+              )}
+              {issue.url && !issue.page_id && <small>{issue.url}</small>}
+              {issue.latest_solution && (
+                <span className={`solution-stage ${issue.latest_solution.workflow_status}`}>
+                  {stageLabels[issue.latest_solution.workflow_status]} · {issue.solution_count} log{issue.solution_count === 1 ? '' : 's'}
+                </span>
+              )}
+            </div>
+            <p>{issue.detail}</p>
+            <div className="issue-item-actions">
+              <button className="secondary compact-button" onClick={() => onSolution(issue)}>
+                {issue.solution_count ? 'View / update solution' : 'View solution'}
+              </button>
+              <button className="secondary compact-button" onClick={() => onTask(issue)}>
+                Create task
+              </button>
+              <label className="priority-control">
+                Priority
+                <select value={issue.priority} onChange={event => onPriority(issue, event.target.value)}>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                  <option value="automatic">Automatic</option>
+                </select>
+              </label>
+              <Link className="issue-source-link" to={`/activity?issue_key=${encodeURIComponent(issue.issue_key)}`}>Activity →</Link>
+              <Link className="issue-source-link" to={sourceRoute(issue)}>Open source →</Link>
+            </div>
+          </article>
+        ))}
+        {group.items.length > visibleCount && (
+          <div className="issue-pages-more">
+            <span>Showing {visibleCount} of {group.items.length.toLocaleString()} affected pages</span>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="secondary compact-button" onClick={() => setVisibleCount(c => c + 50)}>Show 50 more</button>
+              <button className="secondary compact-button" onClick={() => setVisibleCount(group.items.length)}>Show all ({group.items.length})</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </details>
+  )
 }
 
 function PriorityManagement({project,items,loading,error,onChanged}:{project:Project;items:PrioritySetting[];loading:boolean;error:string;onChanged:()=>void}){
   const toolbar=useRef<HTMLDivElement>(null)
-  const [search,setSearch]=useState(''),[priorities,setPriorities]=useState<string[]>([]),[categories,setCategories]=useState<string[]>([]),[saving,setSaving]=useState(''),[localError,setLocalError]=useState('')
+  const [search,setSearch]=useState(''),[priorities,setPriorities]=useState<string[]>([]),[categories,setCategories]=useState<string[]>([]),[showDisabled,setShowDisabled]=useState(true),[saving,setSaving]=useState(''),[localError,setLocalError]=useState('')
   const categoryOptions=useMemo(()=>[...new Set(items.map(item=>item.category))].sort().map(value=>({value,label:value})),[items])
-  const visible=useMemo(()=>items.filter(item=>(!priorities.length||priorities.includes(item.priority))&&(!categories.length||categories.includes(item.category))&&(!search||`${item.label} ${item.type} ${item.category} ${item.source}`.toLowerCase().includes(search.toLowerCase()))),[items,priorities,categories,search])
+  const disabledCount=useMemo(()=>items.filter(item=>item.disabled).length,[items])
+  const visible=useMemo(()=>items.filter(item=>{
+    if(!showDisabled&&item.disabled)return false
+    return (!priorities.length||priorities.includes(item.priority))&&(!categories.length||categories.includes(item.category))&&(!search||`${item.label} ${item.type} ${item.category} ${item.source}`.toLowerCase().includes(search.toLowerCase()))
+  }),[items,priorities,categories,search,showDisabled])
   function keepOneOpen(event:React.SyntheticEvent<HTMLDetailsElement>){if(!event.currentTarget.open)return;toolbar.current?.querySelectorAll<HTMLDetailsElement>('details[open]').forEach(item=>{if(item!==event.currentTarget)item.removeAttribute('open')})}
   async function update(item:PrioritySetting,priority:string|null){setSaving(`${item.source}:${item.type}`);setLocalError('');try{await patchJson(`/api/projects/${project.id}/issues/priority-settings/${item.source}/${encodeURIComponent(item.type)}`,{priority});onChanged()}catch(err){setLocalError((err as Error).message)}finally{setSaving('')}}
+  async function toggleDisabled(item:PrioritySetting){setSaving(`${item.source}:${item.type}`);setLocalError('');try{await patchJson(`/api/projects/${project.id}/issues/priority-settings/${item.source}/${encodeURIComponent(item.type)}`,{disabled:!item.disabled});onChanged()}catch(err){setLocalError((err as Error).message)}finally{setSaving('')}}
   async function resetAll(){if(!window.confirm('Restore every issue type to its built-in default priority? Page-specific priority overrides and historical records will be preserved.'))return;setSaving('all');setLocalError('');try{await api(`/api/projects/${project.id}/issues/priority-settings`,{method:'DELETE'});onChanged()}catch(err){setLocalError((err as Error).message)}finally{setSaving('')}}
-  return <section className="panel priority-management"><div className="panel-title"><div><h2>Priority Management</h2><p>Configure the project-wide default for every automatically detected issue type. Page-specific overrides remain unchanged.</p></div><button className="secondary" disabled={Boolean(saving)} onClick={resetAll}>Restore all defaults</button></div><div ref={toolbar} className="architecture-toolbar issues-filter-toolbar priority-management-toolbar"><div className="search"><Icon name="search"/><input value={search} onChange={event=>setSearch(event.target.value)} placeholder="Search issue types"/></div><CheckboxFilter label="Priority" options={priorityOptions} values={priorities} onChange={setPriorities} onToggle={keepOneOpen}/><CheckboxFilter label="Category" options={categoryOptions} values={categories} onChange={setCategories} onToggle={keepOneOpen}/><span>{visible.length.toLocaleString()} issue types</span></div>{(error||localError)&&<div className="error-box">{localError||error}</div>}{loading?<div className="loading-panel"><div className="spinner"/>Loading priority settings…</div>:<div className="table-scroll priority-settings-table"><table><thead><tr><th>Issue type</th><th>Source</th><th>Category</th><th>Current default</th><th>Detected</th><th>Actions</th></tr></thead><tbody>{visible.map(item=>{const key=`${item.source}:${item.type}`,busy=saving===key;return <tr key={key}><td><strong>{item.label}</strong><small>{item.type.replaceAll('_',' ')}</small></td><td><span className={`issue-source-badge ${item.source}`}>{item.source==='on_page'?'On-Page SEO':'Site Architecture'}</span></td><td>{item.category}</td><td><select className={`priority-select priority-${item.priority}`} value={item.priority} disabled={busy} onChange={event=>update(item,event.target.value)}>{priorityOptions.map(option=><option key={option.value} value={option.value}>{option.label}</option>)}</select>{item.customized&&<small>Custom project default</small>}</td><td>{item.detected_count.toLocaleString()}</td><td><button className="text-button" disabled={!item.customized||busy} onClick={()=>update(item,null)}>Restore default</button></td></tr>})}</tbody></table></div>}</section>
+  return <section className="panel priority-management"><div className="panel-title"><div><h2>Priority Management</h2><p>Configure project-wide defaults and enable or disable individual issue types. Disabled issue types are excluded from detection while preserving history.</p></div><button className="secondary" disabled={Boolean(saving)} onClick={resetAll}>Restore all defaults</button></div><div ref={toolbar} className="architecture-toolbar issues-filter-toolbar priority-management-toolbar"><div className="search"><Icon name="search"/><input value={search} onChange={event=>setSearch(event.target.value)} placeholder="Search issue types"/></div><CheckboxFilter label="Priority" options={priorityOptions} values={priorities} onChange={setPriorities} onToggle={keepOneOpen}/><CheckboxFilter label="Category" options={categoryOptions} values={categories} onChange={setCategories} onToggle={keepOneOpen}/><label className="inline-toggle"><input type="checkbox" checked={showDisabled} onChange={event=>setShowDisabled(event.target.checked)}/><span>Show disabled ({disabledCount})</span></label><span>{visible.length.toLocaleString()} issue types</span></div>{(error||localError)&&<div className="error-box">{localError||error}</div>}{loading?<div className="loading-panel"><div className="spinner"/>Loading priority settings…</div>:<div className="table-scroll priority-settings-table"><table><thead><tr><th>Issue type</th><th>Source</th><th>Category</th><th>Current default</th><th>Detected</th><th>Status</th><th>Actions</th></tr></thead><tbody>{visible.map(item=>{const key=`${item.source}:${item.type}`,busy=saving===key;return <tr key={key} className={item.disabled?'disabled-issue-row':''}><td><strong>{item.label}</strong><small>{item.type.replaceAll('_',' ')}</small></td><td><span className={`issue-source-badge ${item.source}`}>{item.source==='on_page'?'On-Page SEO':'Site Architecture'}</span></td><td>{item.category}</td><td><select className={`priority-select priority-${item.priority}`} value={item.priority} disabled={busy||item.disabled} onChange={event=>update(item,event.target.value)}>{priorityOptions.map(option=><option key={option.value} value={option.value}>{option.label}</option>)}</select>{item.customized&&!item.disabled&&<small>Custom project default</small>}</td><td>{item.disabled?<span className="muted-cell">Disabled</span>:item.detected_count.toLocaleString()}</td><td><button className={`issue-toggle-btn ${item.disabled?'disabled':'enabled'}`} disabled={busy} onClick={()=>toggleDisabled(item)} title={item.disabled?'Click to enable this issue type':'Click to disable this issue type'}>{item.disabled?'Disabled':'Active'}</button></td><td><button className="text-button" disabled={!item.customized||busy||item.disabled} onClick={()=>update(item,null)}>Restore default</button></td></tr>})}</tbody></table></div>}</section>
 }
 
 function SolutionLog({items,loading,error,search,setSearch,stages,setStages,onFollowUp,onPage}:{items:IssueSolution[];loading:boolean;error:string;search:string;setSearch:(value:string)=>void;stages:string[];setStages:(values:string[])=>void;onFollowUp:(item:IssueSolution)=>void;onPage:(item:IssueSolution)=>void}){

@@ -132,6 +132,42 @@ def test_issue_priority_catalog_defaults_and_page_override_precedence(client, pr
     assert preserved_override["priority"] == "low"
 
 
+def test_issue_type_enable_disable_toggle(client, project):
+    page = add_page(client, project["id"], "/disable-review", "Unknown")
+    settings_url = f"/api/projects/{project['id']}/issues/priority-settings"
+    issues_url = f"/api/projects/{project['id']}/issues"
+
+    # Verify initial active state
+    settings = client.get(settings_url).json()
+    unknown_type = next(row for row in settings if row["source"] == "site_architecture" and row["type"] == "unknown_page_type")
+    assert unknown_type["disabled"] is False
+
+    initial_issues = client.get(issues_url).json()
+    assert any(item["type"] == "unknown_page_type" and item["page_id"] == page["id"] for item in initial_issues)
+
+    # Disable the issue type
+    disabled_resp = client.patch(f"{settings_url}/site_architecture/unknown_page_type", json={"disabled": True})
+    assert disabled_resp.status_code == 200, disabled_resp.text
+    assert disabled_resp.json()["disabled"] is True
+
+    # Check settings reflects disabled
+    updated_settings = client.get(settings_url).json()
+    assert next(row for row in updated_settings if row["source"] == "site_architecture" and row["type"] == "unknown_page_type")["disabled"] is True
+
+    # Issue must now be excluded from detection
+    issues_after_disable = client.get(issues_url).json()
+    assert not any(item["type"] == "unknown_page_type" and item["page_id"] == page["id"] for item in issues_after_disable)
+
+    # Re-enable the issue type
+    enabled_resp = client.patch(f"{settings_url}/site_architecture/unknown_page_type", json={"disabled": False})
+    assert enabled_resp.status_code == 200, enabled_resp.text
+    assert enabled_resp.json()["disabled"] is False
+
+    # Issue is detected again
+    issues_after_enable = client.get(issues_url).json()
+    assert any(item["type"] == "unknown_page_type" and item["page_id"] == page["id"] for item in issues_after_enable)
+
+
 def test_malformed_xml_is_rejected(client, project):
     response = client.post(
         f"/api/projects/{project['id']}/architecture/sitemaps/import",
@@ -427,9 +463,12 @@ def test_hierarchy_svg_single_and_multi_map_exports_and_categorized_issue_csv(cl
     assert rows
     assert set(rows[0]) == {
         "Category", "Severity", "Priority", "Issue Type", "Label", "URL", "Detail",
+        "Recommendation",
         "Page Type", "Content Type", "Status Code", "Status", "Indexability",
-        "Indexability Status", "Proposed Sitemap", "Imported Sitemap Occurrences",
+        "Indexability Status", "Canonical URL", "Canonical Status", "Redirect Destination", "Redirect Type",
+        "Sitemap URL or Name", "Proposed Sitemap", "Imported Sitemap Occurrences",
         "Architecture Section", "Path Depth", "Hierarchy Depth", "Approved Parent URL",
+        "Source URL", "Destination URL", "Anchor Text", "Link Position", "Affected Link Count",
     }
 
     individual = client.get(
@@ -452,3 +491,303 @@ def test_hierarchy_svg_single_and_multi_map_exports_and_categorized_issue_csv(cl
     )
     assert filtered_out.status_code == 200
     assert list(csv.DictReader(io.StringIO(filtered_out.text))) == []
+
+
+def _import_csv_helper(client, project_id, source, name, content):
+    staged = client.post(f"/api/projects/{project_id}/imports/stage", data={"source": source}, files={"file": (name, content, "text/csv")})
+    assert staged.status_code == 201, staged.text
+    body = staged.json()
+    confirmed = client.post(f"/api/projects/{project_id}/imports/{body['batch']['id']}/confirm", json={"mapping": body["suggested_mapping"], "headers_verified": True, "complete_snapshot": False})
+    assert confirmed.status_code == 200, confirmed.text
+    return confirmed.json()
+
+
+def test_sitemap_asset_pages_and_missing_sitemap_exclusion(client, project):
+    # 1. Import a sitemap file so has_imported_sitemap is True
+    xml = f'''<?xml version="1.0"?>
+    <urlset xmlns="{NS}">
+      <url><loc>https://shop.example.com/sitemap-listed</loc></url>
+      <url><loc>https://shop.example.com/assets/catalog.pdf</loc></url>
+    </urlset>'''.encode()
+    sitemap_import = client.post(
+        f"/api/projects/{project['id']}/architecture/sitemaps/import",
+        files=[("files", ("sitemap.xml", xml, "application/xml"))],
+    )
+    assert sitemap_import.status_code == 201
+
+    # 2. Import inventory with:
+    # - HTML page not in sitemap -> triggers indexable_missing_sitemap
+    # - PDF asset not in sitemap -> should NOT trigger indexable_missing_sitemap!
+    # - Image asset not in sitemap -> should NOT trigger indexable_missing_sitemap!
+    # - PDF asset in sitemap -> triggers sitemap_asset_page ("Asset Pages in Sitemap")
+    inventory = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type\n"
+        "https://shop.example.com/html-missing,200,OK,Indexable,text/html,PDP\n"
+        "https://shop.example.com/manual.pdf,200,OK,Indexable,application/pdf,Asset\n"
+        "https://shop.example.com/images/hero.jpg,200,OK,Indexable,image/jpeg,Asset\n"
+        "https://shop.example.com/assets/catalog.pdf,200,OK,Indexable,application/pdf,Asset\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "inventory.csv", inventory)
+
+    issues = client.get(f"/api/projects/{project['id']}/architecture/issues").json()
+    missing_issues = [i for i in issues if i["type"] == "indexable_missing_sitemap"]
+    missing_urls = [i["url"] for i in missing_issues]
+    assert "https://shop.example.com/html-missing" in missing_urls
+    # Assets must be automatically excluded from indexable_missing_sitemap
+    assert "https://shop.example.com/manual.pdf" not in missing_urls
+    assert "https://shop.example.com/images/hero.jpg" not in missing_urls
+    assert "https://shop.example.com/assets/catalog.pdf" not in missing_urls
+
+    # Asset listed in sitemap must trigger sitemap_asset_page ("Asset Pages in Sitemap")
+    asset_sitemap_issues = [i for i in issues if i["type"] == "sitemap_asset_page"]
+    assert len(asset_sitemap_issues) == 1
+    assert asset_sitemap_issues[0]["label"] == "Asset Pages in Sitemap"
+    assert asset_sitemap_issues[0]["category"] == "Sitemap"
+    assert asset_sitemap_issues[0]["url"] == "https://shop.example.com/assets/catalog.pdf"
+
+
+def test_synchronise_canonical_and_indexability_changes(client, project):
+    inventory = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type,Canonical Link Element 1\n"
+        "https://shop.example.com/page-a,200,OK,Non-Indexable,text/html,PDP,https://shop.example.com/page-a\n"
+        "https://shop.example.com/page-b,200,OK,Indexable,text/html,PDP,https://shop.example.com/page-target\n"
+        "https://shop.example.com/page-source,200,OK,Indexable,text/html,PDP,https://shop.example.com/page-target\n"
+        "https://shop.example.com/page-target,200,OK,Non-Indexable,text/html,PDP,https://shop.example.com/page-target\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "crawl.csv", inventory)
+
+    # Set sitemap inclusion on page-a and page-b
+    pages = client.get(f"/api/projects/{project['id']}/pages").json()["items"]
+    page_a = next(p for p in pages if p["original_url"].endswith("/page-a"))
+    page_b = next(p for p in pages if p["original_url"].endswith("/page-b"))
+    page_source = next(p for p in pages if p["original_url"].endswith("/page-source"))
+    page_target = next(p for p in pages if p["original_url"].endswith("/page-target"))
+
+    # Include page-a and page-b in sitemap
+    client.patch(f"/api/projects/{project['id']}/pages/{page_a['id']}/manual-overrides", json={"values": {"sitemap_included": True}})
+    client.patch(f"/api/projects/{project['id']}/pages/{page_b['id']}/manual-overrides", json={"values": {"sitemap_included": True}})
+
+    # Verify initial issues:
+    # 1. page-a: sitemap_non_indexable (since in sitemap and non-indexable)
+    # 2. page-b: sitemap_non_canonical (since in sitemap and points to page-target)
+    # 3. page-source on-page: canonical_target_non_indexable (since target is non-indexable)
+    arch_issues = client.get(f"/api/projects/{project['id']}/architecture/issues").json()
+    assert any(i["type"] == "sitemap_non_indexable" and i["page_id"] == page_a["id"] for i in arch_issues)
+    assert any(i["type"] == "sitemap_non_canonical" and i["page_id"] == page_b["id"] for i in arch_issues)
+
+    on_page_issues = client.get(f"/api/projects/{project['id']}/on-page/issues?status=All").json()
+    assert any(i["type"] == "canonical_target_non_indexable" and i["page_id"] == page_source["id"] for i in on_page_issues)
+
+    # Example 1: Manually change page-a to Indexable -> sitemap_non_indexable must immediately vanish
+    client.patch(f"/api/projects/{project['id']}/pages/{page_a['id']}/manual-overrides", json={"values": {"indexability": "Indexable"}})
+    arch_issues_after = client.get(f"/api/projects/{project['id']}/architecture/issues").json()
+    assert not any(i["type"] == "sitemap_non_indexable" and i["page_id"] == page_a["id"] for i in arch_issues_after)
+
+    # Example 2: Manually change page-b canonical to self-canonical -> sitemap_non_canonical must vanish
+    client.patch(f"/api/projects/{project['id']}/pages/{page_b['id']}/manual-overrides", json={"values": {"canonical_url": page_b["original_url"]}})
+    arch_issues_after2 = client.get(f"/api/projects/{project['id']}/architecture/issues").json()
+    assert not any(i["type"] == "sitemap_non_canonical" and i["page_id"] == page_b["id"] for i in arch_issues_after2)
+
+    # Example 3: Manually change target page indexability to Indexable -> canonical_target_non_indexable must vanish
+    client.patch(f"/api/projects/{project['id']}/pages/{page_target['id']}/manual-overrides", json={"values": {"indexability": "Indexable"}})
+    on_page_after = client.get(f"/api/projects/{project['id']}/on-page/issues?status=All").json()
+    assert not any(i["type"] == "canonical_target_non_indexable" and i["page_id"] == page_source["id"] for i in on_page_after)
+
+
+def test_crawl_discrepancy_detection_and_preservation(client, project):
+    inventory1 = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type\n"
+        "https://shop.example.com/product-1,200,OK,Indexable,text/html,PDP\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "crawl1.csv", inventory1)
+
+    pages = client.get(f"/api/projects/{project['id']}/pages").json()["items"]
+    page1 = pages[0]
+    # Set manual override to Indexable (matches initial crawl)
+    client.patch(f"/api/projects/{project['id']}/pages/{page1['id']}/manual-overrides", json={"values": {"indexability": "Indexable"}})
+
+    page_detail = client.get(f"/api/projects/{project['id']}/pages/{page1['id']}").json()
+    assert page_detail["effective"]["indexability"] == "Indexable"
+    assert not page_detail["effective"]["has_discrepancy"]
+
+    # New crawl arrives with Non-Indexable (contradicting the manual override)
+    inventory2 = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type\n"
+        "https://shop.example.com/product-1,200,OK,Non-Indexable,text/html,PDP\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "crawl2.csv", inventory2)
+
+    page_detail_after = client.get(f"/api/projects/{project['id']}/pages/{page1['id']}").json()
+    # 1. Raw DB column preserves original imported Screaming Frog data
+    assert page_detail_after["indexability"] == "Non-Indexable"
+    # 2. Manual override is preserved and takes precedence in effective data
+    assert page_detail_after["manual_overrides"]["indexability"] == "Indexable"
+    assert page_detail_after["effective"]["indexability"] == "Indexable"
+    # 3. Discrepancy is clearly identified
+    assert page_detail_after["effective"]["has_discrepancy"] is True
+    assert len(page_detail_after["effective"]["discrepancies"]) == 1
+    assert page_detail_after["effective"]["discrepancies"][0]["field"] == "indexability"
+
+
+def test_inventory_csv_export_filtered_and_columns(client, project):
+    # Setup inventory with multiple pages
+    inventory = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type,Canonical Link Element 1,Redirect URL\n"
+        "https://shop.example.com/shoes,200,OK,Indexable,text/html,PLP,https://shop.example.com/shoes,\n"
+        "https://shop.example.com/boot-1,200,OK,Indexable,text/html,PDP,https://shop.example.com/boot-1,\n"
+        "https://shop.example.com/boot-2,200,OK,Non-Indexable,text/html,PDP,https://shop.example.com/boot-2,\n"
+        "https://shop.example.com/old-shoes,301,Moved Permanently,Non-Indexable,text/html,Other,,https://shop.example.com/shoes\n"
+        "https://shop.example.com/broken-page,404,Not Found,Non-Indexable,text/html,Utility,,\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "inventory-crawl.csv", inventory)
+
+    pages = client.get(f"/api/projects/{project['id']}/pages").json()["items"]
+    shoes = next(p for p in pages if p["original_url"].endswith("/shoes"))
+    boot1 = next(p for p in pages if p["original_url"].endswith("/boot-1"))
+    # Include shoes and boot1 in sitemap
+    client.patch(
+        f"/api/projects/{project['id']}/architecture/inventory/bulk-sitemap",
+        json={"page_ids": [shoes["id"], boot1["id"]], "included": True},
+    )
+
+    # 1. Unfiltered export returns all matching pages
+    resp_all = client.get(f"/api/projects/{project['id']}/architecture/inventory.csv")
+    assert resp_all.status_code == 200
+    assert "attachment; filename=\"architecture-inventory.csv\"" in resp_all.headers["content-disposition"]
+    rows_all = list(csv.DictReader(io.StringIO(resp_all.text)))
+    assert len(rows_all) == 5
+    first_row = rows_all[0]
+    assert "URL" in first_row
+    assert "Route" in first_row
+    assert "Page Type" in first_row
+    assert "HTTP Status Code" in first_row
+    assert "Indexability" in first_row
+    assert "Proposed XML Sitemap" in first_row
+
+    # 2. Filtered export by page_types (PDP only)
+    resp_pdp = client.get(
+        f"/api/projects/{project['id']}/architecture/inventory.csv",
+        params=[("page_types", "PDP")],
+    )
+    assert resp_pdp.status_code == 200
+    rows_pdp = list(csv.DictReader(io.StringIO(resp_pdp.text)))
+    assert len(rows_pdp) == 2
+    assert {r["Page Type"] for r in rows_pdp} == {"PDP"}
+
+    # 3. Filtered export by search term
+    resp_search = client.get(
+        f"/api/projects/{project['id']}/architecture/inventory.csv",
+        params={"search": "boot"},
+    )
+    assert resp_search.status_code == 200
+    rows_search = list(csv.DictReader(io.StringIO(resp_search.text)))
+    assert len(rows_search) == 2
+    assert all("boot" in r["URL"] for r in rows_search)
+
+    # 4. Respect selected columns
+    resp_cols = client.get(
+        f"/api/projects/{project['id']}/architecture/inventory.csv",
+        params=[("columns", "route"), ("columns", "page_type"), ("columns", "proposed_sitemap")],
+    )
+    assert resp_cols.status_code == 200
+    rows_cols = list(csv.DictReader(io.StringIO(resp_cols.text)))
+    assert set(rows_cols[0].keys()) == {"URL", "Route", "Page Type", "Proposed XML Sitemap"}
+
+
+def test_sitemap_proposed_and_imported_csv_exports(client, project):
+    inventory = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type\n"
+        "https://shop.example.com/shoes,200,OK,Indexable,text/html,PLP\n"
+        "https://shop.example.com/boot-1,200,OK,Indexable,text/html,PDP\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "inventory.csv", inventory)
+
+    pages = client.get(f"/api/projects/{project['id']}/pages").json()["items"]
+    shoes = next(p for p in pages if p["original_url"].endswith("/shoes"))
+    client.patch(
+        f"/api/projects/{project['id']}/architecture/inventory/bulk-sitemap",
+        json={"page_ids": [shoes["id"]], "included": True},
+    )
+
+    # Proposed sitemap CSV
+    resp_prop = client.get(f"/api/projects/{project['id']}/architecture/sitemaps/proposed.csv")
+    assert resp_prop.status_code == 200
+    assert "proposed-sitemap.csv" in resp_prop.headers["content-disposition"]
+    rows_prop = list(csv.DictReader(io.StringIO(resp_prop.text)))
+    assert len(rows_prop) == 1
+    assert rows_prop[0]["URL"] == "https://shop.example.com/shoes"
+    assert rows_prop[0]["Proposed XML Sitemap"] == "Included"
+
+    # Import sitemap XML
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://shop.example.com/shoes</loc><lastmod>2026-11-01</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>
+      <url><loc>https://shop.example.com/external-url</loc></url>
+    </urlset>"""
+    client.post(
+        f"/api/projects/{project['id']}/architecture/sitemaps/import",
+        files=[("files", ("sitemap.xml", xml, "application/xml"))],
+    )
+
+    # Imported sitemap CSV
+    resp_imp = client.get(f"/api/projects/{project['id']}/architecture/sitemaps/imported.csv")
+    assert resp_imp.status_code == 200
+    assert "imported-sitemap-entries.csv" in resp_imp.headers["content-disposition"]
+    rows_imp = list(csv.DictReader(io.StringIO(resp_imp.text)))
+    assert len(rows_imp) == 2
+    shoes_entry = next(r for r in rows_imp if r["Sitemap URL"].endswith("/shoes"))
+    assert shoes_entry["Sitemap Document"] == "sitemap.xml"
+    assert shoes_entry["Lastmod"] == "2026-11-01"
+    assert shoes_entry["Priority"] == "0.8"
+
+
+def test_issues_csv_complete_metrics_and_filters(client, project):
+    inventory = (
+        "Address,Status Code,Status,Indexability,Content Type,Page Type,Redirect URL,Canonical Link Element 1\n"
+        "https://shop.example.com/error-page,404,Not Found,Non-Indexable,text/html,Utility,,\n"
+        "https://shop.example.com/temp-redirect,302,Found,Non-Indexable,text/html,Other,https://shop.example.com/target,\n"
+    )
+    _import_csv_helper(client, project["id"], "screaming_frog", "crawl.csv", inventory)
+
+    pages = client.get(f"/api/projects/{project['id']}/pages").json()["items"]
+    error_page = next(p for p in pages if p["original_url"].endswith("/error-page"))
+    patch_resp = client.patch(f"/api/projects/{project['id']}/pages/bulk-type", json={"page_ids": [error_page["id"]], "page_type": "Editorial"})
+    assert patch_resp.status_code == 200
+
+    # Central issues CSV
+    resp = client.get(f"/api/projects/{project['id']}/issues.csv")
+    assert resp.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    assert rows
+
+    # Verify status code issue metrics
+    error_issue = next(r for r in rows if r["Issue Type"] == "http_4xx")
+    assert error_issue["Affected URL"] == "https://shop.example.com/error-page"
+    assert error_issue["HTTP Status Code"] == "404"
+    assert error_issue["Status Text"] == "Not Found"
+    assert error_issue["Content Type"] == "text/html"
+    assert error_issue["Page Type"] == "Editorial"
+    assert error_issue["Recommendation"] != ""
+
+    redirect_issue = next(r for r in rows if r["Issue Type"] == "redirect_302")
+    assert redirect_issue["Redirect Destination"] == "https://shop.example.com/target"
+
+    # Verify search and filter parameters on central issues CSV
+    resp_filtered = client.get(
+        f"/api/projects/{project['id']}/issues.csv",
+        params={"search": "error-page"},
+    )
+    assert resp_filtered.status_code == 200
+    filtered_rows = list(csv.DictReader(io.StringIO(resp_filtered.text)))
+    assert len(filtered_rows) == 2
+    assert all(r["Affected URL"] == "https://shop.example.com/error-page" for r in filtered_rows)
+
+    resp_type = client.get(
+        f"/api/projects/{project['id']}/issues.csv",
+        params={"issue_type": "http_4xx"},
+    )
+    assert resp_type.status_code == 200
+    type_rows = list(csv.DictReader(io.StringIO(resp_type.text)))
+    assert len(type_rows) == 1
+    assert type_rows[0]["Issue Type"] == "http_4xx"
+

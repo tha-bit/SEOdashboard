@@ -8,8 +8,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..models import AuditCase, Page, PageRelationship, PageType, Project, SitemapDocument, SitemapEntry
+from .cache import get_cached_architecture_issues, set_cached_architecture_issues
 from .on_page import latest_metadata
 from .page_signals import computed_priority, page_signals, same_project_host
+from .page_types import is_asset_page
 from .issue_priorities import resolve_priority
 from .urls import normalize_url
 
@@ -199,7 +201,33 @@ def approve_parent_proposals(db: Session, project: Project, relationship_ids: li
     }
 
 
+def default_architecture_recommendation(issue_type: str) -> str:
+    recommendations = {
+        "http_4xx": "Fix the broken link or implement a 301 redirect to an active, relevant destination.",
+        "http_5xx": "Investigate server or application logs to resolve the response error.",
+        "redirect_302": "Update to a permanent 301 redirect if the page relocation is intended to be permanent.",
+        "redirect_loop": "Resolve the circular redirect to return a direct 200 OK or final destination.",
+        "redirect_target_invalid": "Correct the redirect target to a valid, absolute URL.",
+        "redirect_target_missing": "Provide an explicit redirect destination for this URL.",
+        "sitemap_non_canonical": "Remove this non-canonical URL from the sitemap or replace it with its canonical destination.",
+        "sitemap_non_indexable": "Remove non-indexable URLs from the sitemap or update robots/canonical signals if it should be indexable.",
+        "sitemap_redirect_or_error": "Remove redirected or error status URLs from the XML sitemap; only 200 OK URLs should be listed.",
+        "sitemap_asset_page": "Review whether asset files belong in this XML sitemap or should be separated into dedicated sitemaps.",
+        "sitemap_eligibility_unverified": "Supply crawl status and indexability data to verify sitemap eligibility.",
+        "indexable_missing_sitemap": "Review this indexable HTML page and include it in the XML sitemap if commercially valuable.",
+        "deep_commercial_page_without_parent": "Assign an approved parent page in the hierarchy to reduce crawl depth and improve findability.",
+        "duplicate_proposed_parent": "Review conflicting parent proposals and confirm a single primary parent in the hierarchy.",
+        "unresolved_sitemap_reference": "Upload the missing local XML sitemap file or provide a ZIP bundle containing it.",
+        "imported_sitemap_url_issue": "Correct the malformed or out-of-domain URL in the imported sitemap source.",
+        "unknown_page_type": "Assign a page type (PDP, PLP, Editorial, Utility, Asset) to enable structural analysis.",
+    }
+    return recommendations.get(issue_type, "Review page attributes and update the site architecture accordingly.")
+
+
 def architecture_issues(db: Session, project: Project) -> list[dict]:
+    cached = get_cached_architecture_issues(project.id)
+    if cached is not None:
+        return cached
     pages = list(db.scalars(select(Page).where(Page.project_id == project.id, Page.page_type != PageType.DRAFT.value)))
     pages_by_id = {page.id: page for page in pages}
     parents = parent_map(db, project.id)
@@ -207,11 +235,18 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
     imported_sitemap_counts = Counter(db.scalars(select(SitemapEntry.page_id).where(SitemapEntry.project_id == project.id, SitemapEntry.page_id.is_not(None))))
     imported_sitemap_page_ids = set(imported_sitemap_counts)
     has_imported_sitemap = bool(db.scalar(select(SitemapDocument.id).where(SitemapDocument.project_id == project.id).limit(1)))
+    sitemap_doc_names = dict(db.execute(select(SitemapDocument.id, SitemapDocument.file_name).where(SitemapDocument.project_id == project.id)).all())
+    page_sitemaps: dict[str, list[str]] = {}
+    for entry_pid, entry_doc_id in db.execute(select(SitemapEntry.page_id, SitemapEntry.document_id).where(SitemapEntry.project_id == project.id, SitemapEntry.page_id.is_not(None))):
+        doc_name = sitemap_doc_names.get(entry_doc_id)
+        if doc_name and doc_name not in page_sitemaps.setdefault(entry_pid, []):
+            page_sitemaps[entry_pid].append(doc_name)
     snapshots = latest_metadata(db, project.id)
     pages_by_url = {page.normalized_url: page for page in pages}
+    signals_by_page = {page.id: page_signals(page, snapshots.get(page.id), imported_sitemap_counts.get(page.id, 0), project.preferences) for page in pages}
     issues: list[dict] = []
     for page in pages:
-        signals = page_signals(page, snapshots.get(page.id), imported_sitemap_counts.get(page.id, 0), project.preferences)
+        signals = signals_by_page[page.id]
         path_depth = len([part for part in urlsplit(page.normalized_url).path.split("/") if part])
         status = signals["http_status"]
         if status is not None and 400 <= int(status) < 500:
@@ -243,8 +278,11 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
                 target = pages_by_url.get(canonical_identity) if canonical_identity else None
                 if canonical_identity and same_project_host(canonical, project.site_url) and not target:
                     issues.append({"type": "canonical_target_unknown", "severity": "warning", "page_id": page.id, "url": page.original_url, "label": "Canonical target is not in inventory", "detail": f"Canonical target could not be matched: {canonical}"})
-                if target and target.http_status and target.http_status >= 400:
-                    issues.append({"type": "canonical_target_broken", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Canonical target returns an error", "detail": f"Canonical target {target.original_url} has status {target.http_status}."})
+                if target:
+                    target_signals = signals_by_page.get(target.id) or page_signals(target, snapshots.get(target.id), imported_sitemap_counts.get(target.id, 0), project.preferences)
+                    target_status = target_signals["http_status"]
+                    if target_status and int(target_status) >= 400:
+                        issues.append({"type": "canonical_target_broken", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Canonical target returns an error", "detail": f"Canonical target {target.original_url} has status {target_status}."})
         if signals["is_indexable"] and signals["canonical_status"] == "non_canonical":
             issues.append({"type": "indexable_non_canonical", "severity": "warning", "page_id": page.id, "url": page.original_url, "label": "Indexable non-canonical page", "detail": f"The page is indexable but canonicalises to {canonical}. Review whether both signals are intentional."})
         if signals["is_non_indexable"] and signals["canonical_status"] == "canonical":
@@ -252,22 +290,23 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
         if signals["sitemap_any"] and signals["canonical_status"] == "non_canonical":
             issues.append({"type": "sitemap_non_canonical", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Non-canonical URL is sitemap-listed", "detail": f"The sitemap should normally contain the canonical target instead: {canonical}."})
         if has_imported_sitemap and signals["is_indexable"] and signals["canonical_status"] in {"canonical", "unknown"} and not signals["sitemap_any"]:
-            issues.append({"type": "indexable_missing_sitemap", "severity": "warning" if page.page_type in {"Homepage", "PDP", "PLP"} else "info", "page_id": page.id, "url": page.original_url, "label": "Indexable URL missing from sitemap", "detail": "Imported sitemap evidence exists, but this indexable page is not listed."})
+            if not is_asset_page(page, signals):
+                issues.append({"type": "indexable_missing_sitemap", "severity": "warning" if page.page_type in {"Homepage", "PDP", "PLP"} else "info", "page_id": page.id, "url": page.original_url, "label": "Indexable URL missing from sitemap", "detail": "Imported sitemap evidence exists, but this indexable page is not listed."})
         if page.page_type != "Homepage" and page.id not in parents:
             issues.append({"type": "hierarchy_orphan", "severity": "info", "page_id": page.id, "url": page.original_url, "label": "Orphan in manually defined hierarchy", "detail": "This does not prove the page is an actual crawl orphan."})
         if depths.get(page.id) is None:
             issues.append({"type": "circular_parent", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Circular primary-parent relationship", "detail": "Approved hierarchy depth cannot be calculated."})
         if page.page_type == "Unknown":
             issues.append({"type": "unknown_page_type", "severity": "warning", "page_id": page.id, "url": page.original_url, "label": "Unknown page type", "detail": "Classify this Page before relying on architecture checks."})
-        if page.sitemap_included is True or page.id in imported_sitemap_page_ids:
+        if signals["sitemap_any"]:
             membership = "Proposed or imported sitemap"
-            if page.page_type == "Asset" or (page.content_type and "html" not in page.content_type.lower() and "pdf" not in page.content_type.lower()):
-                issues.append({"type": "sitemap_asset_or_non_html", "severity": "warning", "page_id": page.id, "url": page.original_url, "label": "Asset or non-HTML resource is sitemap-listed", "detail": f"{membership}; page type is {page.page_type} and content type is {page.content_type or 'unknown'}. Review whether it belongs in the XML sitemap."})
-            if page.http_status and page.http_status >= 300:
-                issues.append({"type": "sitemap_redirect_or_error", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Sitemap-listed page is redirected or unavailable", "detail": f"{membership}; latest imported status is {page.http_status}."})
-            if page.indexability and "non" in page.indexability.lower():
-                issues.append({"type": "sitemap_non_indexable", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Sitemap-listed page is non-indexable", "detail": page.indexability_status or page.indexability})
-            if page.sitemap_included is True and (page.http_status is None or page.indexability is None):
+            if is_asset_page(page, signals):
+                issues.append({"type": "sitemap_asset_page", "severity": "warning", "page_id": page.id, "url": page.original_url, "label": "Asset Pages in Sitemap", "detail": f"{membership}; page type is {page.page_type} and content type is {signals['content_type'] or page.content_type or 'unknown'}. Review whether it belongs in the XML sitemap."})
+            if status is not None and int(status) >= 300:
+                issues.append({"type": "sitemap_redirect_or_error", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Sitemap-listed page is redirected or unavailable", "detail": f"{membership}; latest effective status is {status}."})
+            if signals["is_non_indexable"]:
+                issues.append({"type": "sitemap_non_indexable", "severity": "error", "page_id": page.id, "url": page.original_url, "label": "Sitemap-listed page is non-indexable", "detail": signals["indexability_status"] or signals["indexability"]})
+            if signals["sitemap_included"] is True and (signals["http_status"] is None or signals["indexability"] is None):
                 issues.append({"type": "sitemap_eligibility_unverified", "severity": "info", "page_id": page.id, "url": page.original_url, "label": "Sitemap eligibility is unverified", "detail": "Status or indexability evidence is missing; eligibility was not assumed."})
         if page.page_type in {"PLP", "PDP"} and path_depth >= 2 and page.id not in parents:
             issues.append({"type": "deep_commercial_page_without_parent", "severity": "warning", "page_id": page.id, "url": page.original_url, "label": "Deep PLP/PDP without declared parent", "detail": "Heuristic based on path depth only; review rather than assuming a parent."})
@@ -280,7 +319,8 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
         for reference in document.unresolved_references:
             issues.append({"type": "unresolved_sitemap_reference", "severity": "warning", "page_id": None, "url": reference, "label": "Referenced sitemap file not supplied", "detail": f"Referenced by {document.file_name}; upload the local file or a ZIP containing it."})
     for entry in db.scalars(select(SitemapEntry).where(SitemapEntry.project_id == project.id, SitemapEntry.issue.is_not(None))):
-        issues.append({"type": "imported_sitemap_url_issue", "severity": "warning", "page_id": entry.page_id, "url": entry.loc, "label": "Imported sitemap URL needs review", "detail": entry.issue})
+        doc_name = sitemap_doc_names.get(entry.document_id)
+        issues.append({"type": "imported_sitemap_url_issue", "severity": "warning", "page_id": entry.page_id, "url": entry.loc, "label": "Imported sitemap URL needs review", "detail": entry.issue, "sitemap_name": doc_name})
     priority_cases = {case.issue_key: case for case in db.scalars(select(AuditCase).where(AuditCase.project_id == project.id, AuditCase.issue_key.is_not(None)))}
     for issue in issues:
         issue["issue_key"] = f"architecture:{issue['type']}:{issue.get('page_id') or issue.get('url') or 'project'}"
@@ -288,14 +328,22 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
         page = pages_by_id.get(issue.get("page_id"))
         parent = pages_by_id.get(parents.get(page.id)) if page and parents.get(page.id) else None
         path_depth = len([part for part in urlsplit(page.normalized_url).path.split("/") if part]) if page else None
+        page_sig = signals_by_page.get(page.id) if page else None
         issue.update({
+            "sitemap_name": issue.get("sitemap_name") or (", ".join(page_sitemaps.get(page.id, [])) if page else ""),
+            "recommendation": issue.get("recommendation") or default_architecture_recommendation(issue["type"]),
             "page_type": page.page_type if page else None,
-            "content_type": page.content_type if page else None,
-            "http_status": page.http_status if page else None,
-            "http_status_text": page.http_status_text if page else None,
-            "indexability": page.indexability if page else None,
-            "indexability_status": page.indexability_status if page else None,
-            "sitemap_included": page.sitemap_included if page else None,
+            "content_type": page_sig["content_type"] if page_sig else (page.content_type if page else None),
+            "http_status": page_sig["http_status"] if page_sig else (page.http_status if page else None),
+            "http_status_text": page_sig["http_status_text"] if page_sig else (page.http_status_text if page else None),
+            "indexability": page_sig["indexability"] if page_sig else (page.indexability if page else None),
+            "indexability_status": page_sig["indexability_status"] if page_sig else (page.indexability_status if page else None),
+            "canonical_url": page_sig["canonical_url"] if page_sig else None,
+            "canonical_status": page_sig["canonical_status"] if page_sig else None,
+            "redirect_uri": page_sig["redirect_uri"] if page_sig else None,
+            "redirect_type": page_sig["redirect_type"] if page_sig else None,
+            "sitemap_included": page_sig["sitemap_included"] if page_sig else (page.sitemap_included if page else None),
+            "in_imported_sitemap": page_sig["in_imported_sitemap"] if page_sig else False,
             "imported_sitemap_occurrences": imported_sitemap_counts.get(page.id, 0) if page else 0,
             "architecture_section": page.architecture_section if page else None,
             "path_depth": path_depth,
@@ -303,7 +351,7 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
             "parent_url": parent.original_url if parent else None,
         })
         if page:
-            signals = page_signals(page, snapshots.get(page.id), imported_sitemap_counts.get(page.id, 0), project.preferences)
+            signals = page_sig
             issue["priority"] = computed_priority(page, issue["severity"], signals, technical=issue["category"] in {"Technical SEO", "Sitemap"})
         else:
             issue["priority"] = "high" if issue["severity"] == "error" else "medium" if issue["severity"] == "warning" else "low"
@@ -320,6 +368,7 @@ def architecture_issues(db: Session, project: Project) -> list[dict]:
         if case and case.priority_override:
             issue["priority"] = case.priority_override
     issues.extend(link_issues)
+    set_cached_architecture_issues(project.id, issues)
     return issues
 
 

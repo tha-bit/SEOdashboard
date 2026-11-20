@@ -87,6 +87,7 @@ class IssuePriorityUpdate(BaseModel):
 
 class IssueTypePriorityUpdate(BaseModel):
     priority: str | None = None
+    disabled: bool | None = None
 
 
 class BulkSitemapUpdate(BaseModel):

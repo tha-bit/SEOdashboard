@@ -36,9 +36,10 @@ from .services.activity import add_activity
 from .services.on_page import latest_metadata, on_page_issues
 from .services.architecture import architecture_issues
 from .services.page_signals import EDITABLE_FIELDS, matches_url, page_signals
-from .services.issue_priorities import ISSUE_TYPE_DEFINITIONS, PRIORITY_LEVELS, preference_key, priority_catalog
+from .services.issue_priorities import ISSUE_TYPE_DEFINITIONS, PRIORITY_LEVELS, disabled_key, is_disabled, preference_key, priority_catalog
 from .services.keywords import confirm_keyword_import, current_keyword_rows
 from .services.internal_links import effective_internal_inlinks, latest_snapshot as latest_internal_link_snapshot, page_crawl_link_metrics, page_link_counts
+from .services.cache import invalidate_project_cache
 
 
 @asynccontextmanager
@@ -151,10 +152,12 @@ def serialize_issue_solution(item: IssueSolution) -> dict:
 def unified_issue_rows(db: Session, project: Project, status: str = "open") -> list[dict]:
     rows = []
     for issue in architecture_issues(db, project):
+        if is_disabled(project.preferences, "site_architecture", issue["type"]):
+            continue
         rows.append({**issue, "source": "site_architecture", "source_label": "Site Architecture", "source_severity": issue["severity"], "status": "open"})
     severity_map = {"high": "error", "review": "warning", "info": "info"}
     for issue in on_page_issues(db, project):
-        if status != "All" and issue["status"] != status:
+        if is_disabled(project.preferences, "on_page", issue["type"]):
             continue
         rows.append({**issue, "source": "on_page", "source_label": "On-Page SEO", "source_severity": issue["severity"], "severity": severity_map[issue["severity"]], "category": on_page_issue_category(issue["type"])})
     solution_groups: dict[tuple[str, str], list[IssueSolution]] = {}
@@ -168,7 +171,9 @@ def unified_issue_rows(db: Session, project: Project, status: str = "open") -> l
         matches = solution_groups.get((issue["source"], issue["issue_key"]), [])
         issue["solution_count"] = len(matches)
         issue["latest_solution"] = serialize_issue_solution(matches[0]) if matches else None
+        issue["workflow_status"] = matches[0].workflow_status if matches else None
         issue["status"] = matches[0].workflow_status if matches else issue.get("status", "open")
+        issue["seo_active"] = True
         issue["page_type"] = page_types.get(issue.get("page_id"))
         recommended_solution = matches[0].summary if matches else issue.get("recommendation")
         recommendation = recommendations.get(issue.get("page_id"))
@@ -191,14 +196,93 @@ def all_project_issues(project_id: str, status: str = "open", db: Session = Depe
 
 
 @app.get("/api/projects/{project_id}/issues.csv")
-def all_project_issues_csv(project_id: str, status: str = "open", db: Session = Depends(get_db)):
+def all_project_issues_csv(
+    project_id: str,
+    status: str | None = None,
+    source: str | None = None,
+    category: str | None = None,
+    categories: list[str] | None = Query(None),
+    priority: str | None = None,
+    priorities: list[str] | None = Query(None),
+    issue_type: str | None = None,
+    search: str | None = None,
+    db: Session = Depends(get_db),
+):
+    project = project_or_404(db, project_id)
+    rows = unified_issue_rows(db, project, status or "all")
+    if source and source != "all":
+        rows = [row for row in rows if row["source"] == source]
+    selected_categories = categories or ([category] if category and category != "all" else [])
+    if selected_categories:
+        rows = [row for row in rows if row["category"] in selected_categories]
+    selected_priorities = priorities or ([priority] if priority and priority != "all" else [])
+    if selected_priorities:
+        rows = [row for row in rows if row["priority"] in selected_priorities]
+    if issue_type:
+        rows = [row for row in rows if row["type"] == issue_type]
+    if search and search.strip():
+        term = search.strip().casefold()
+        rows = [
+            row for row in rows
+            if term in f'{row.get("source_label")} {row.get("category")} {row.get("label")} {row.get("type")} {row.get("url") or ""} {row.get("detail")} {row.get("recommendation") or ""}'.casefold()
+        ]
+
+    fieldnames = [
+        "Source", "Category", "Priority", "Source Severity", "Status", "Issue Type", "Label",
+        "Affected URL", "URL", "Page Type", "Content Type", "HTTP Status Code", "Status Text",
+        "Indexability", "Indexability Status", "Canonical URL", "Canonical Status",
+        "Redirect Destination", "Redirect Type", "Sitemap URL or Name", "Proposed Sitemap",
+        "Imported Sitemap Occurrences", "Source URL", "Destination URL", "Anchor Text",
+        "Link Position", "Affected Link Count", "Detail", "Recommendation",
+        "Solution Entries", "Latest Solution Stage", "Latest Solution Action",
+        "Latest Solution Summary", "Latest Solution Owner", "Latest Solution Date",
+    ]
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["Source", "Category", "Priority", "Source Severity", "Status", "Issue Type", "Label", "URL", "Detail", "Solution Entries", "Latest Solution Stage", "Latest Solution Action", "Latest Solution Summary", "Latest Solution Owner", "Latest Solution Date"])
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
-    for issue in unified_issue_rows(db, project_or_404(db, project_id), status):
+    for issue in rows:
         latest = issue.get("latest_solution") or {}
-        writer.writerow({"Source": issue["source_label"], "Category": issue["category"], "Priority": issue["priority"], "Source Severity": issue["source_severity"], "Status": issue["status"], "Issue Type": issue["type"], "Label": issue["label"], "URL": issue.get("url") or "", "Detail": issue["detail"], "Solution Entries": issue["solution_count"], "Latest Solution Stage": latest.get("workflow_status", ""), "Latest Solution Action": latest.get("action", ""), "Latest Solution Summary": latest.get("summary", ""), "Latest Solution Owner": latest.get("owner", ""), "Latest Solution Date": latest.get("created_at", "")})
-    return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="all-issues.csv"'})
+        evidence = issue.get("evidence") or {}
+        has_page_metrics = issue.get("page_type") is not None
+        sitemap_decision = "Included" if issue.get("sitemap_included") is True else "Excluded" if issue.get("sitemap_included") is False else "Unreviewed" if has_page_metrics else ""
+        writer.writerow({
+            "Source": issue["source_label"],
+            "Category": issue["category"],
+            "Priority": issue["priority"],
+            "Source Severity": issue["source_severity"],
+            "Status": issue["status"],
+            "Issue Type": issue["type"],
+            "Label": issue["label"],
+            "Affected URL": issue.get("url") or "",
+            "URL": issue.get("url") or "",
+            "Page Type": issue.get("page_type") or "",
+            "Content Type": issue.get("content_type") or "",
+            "HTTP Status Code": issue.get("http_status") if issue.get("http_status") is not None else (issue.get("status_code") if issue.get("status_code") is not None else ""),
+            "Status Text": issue.get("http_status_text") or "",
+            "Indexability": issue.get("indexability") or "",
+            "Indexability Status": issue.get("indexability_status") or "",
+            "Canonical URL": issue.get("canonical_url") or "",
+            "Canonical Status": issue.get("canonical_status") or "",
+            "Redirect Destination": issue.get("redirect_uri") or "",
+            "Redirect Type": issue.get("redirect_type") or "",
+            "Sitemap URL or Name": issue.get("sitemap_name") or "",
+            "Proposed Sitemap": sitemap_decision,
+            "Imported Sitemap Occurrences": issue.get("imported_sitemap_occurrences", "") if has_page_metrics else "",
+            "Source URL": issue.get("source_url") or evidence.get("source_url") or "",
+            "Destination URL": issue.get("destination_url") or evidence.get("destination_url") or "",
+            "Anchor Text": issue.get("anchor") or evidence.get("anchor") or "",
+            "Link Position": issue.get("link_position") or evidence.get("link_position") or "",
+            "Affected Link Count": issue.get("affected_link_count") if issue.get("affected_link_count") is not None else evidence.get("affected_link_count", ""),
+            "Detail": issue["detail"],
+            "Recommendation": issue.get("recommendation") or issue.get("recommended_solution") or "",
+            "Solution Entries": issue["solution_count"],
+            "Latest Solution Stage": latest.get("workflow_status", ""),
+            "Latest Solution Action": latest.get("action", ""),
+            "Latest Solution Summary": latest.get("summary", ""),
+            "Latest Solution Owner": latest.get("owner", ""),
+            "Latest Solution Date": latest.get("created_at", ""),
+        })
+    return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="all-issues.csv"'})
 
 
 @app.get("/api/projects/{project_id}/issues/priority-settings")
@@ -222,16 +306,33 @@ def update_issue_type_priority(project_id: str, source: str, issue_type: str, pa
     preferences = dict(project.preferences or {})
     configured = dict(preferences.get("issue_priority_defaults") or {})
     key = preference_key(source, issue_type)
-    before = configured.get(key) or definition["default_priority"]
-    if payload.priority is None:
-        configured.pop(key, None)
-    else:
-        configured[key] = payload.priority
-    preferences["issue_priority_defaults"] = configured
+    fields_set = payload.model_fields_set
+
+    if "priority" in fields_set:
+        before = configured.get(key) or definition["default_priority"]
+        if payload.priority is None:
+            configured.pop(key, None)
+        else:
+            configured[key] = payload.priority
+        preferences["issue_priority_defaults"] = configured
+        add_activity(db, project.id, source="issue_review", section=source, action_type="issue_default_priority_changed", status="changed", title=f"Default priority changed: {definition['label']}", issue_type=issue_type, before_data={"priority": before}, after_data={"priority": payload.priority or definition["default_priority"]})
+
+    if "disabled" in fields_set and payload.disabled is not None:
+        disabled_map = dict(preferences.get("issue_disabled") or {})
+        dk = disabled_key(source, issue_type)
+        if payload.disabled:
+            disabled_map[dk] = True
+        else:
+            disabled_map.pop(dk, None)
+        preferences["issue_disabled"] = disabled_map
+        add_activity(db, project.id, source="issue_review", section=source, action_type="issue_type_disabled" if payload.disabled else "issue_type_enabled", status="changed", title=f"Issue type {'disabled' if payload.disabled else 'enabled'}: {definition['label']}", issue_type=issue_type, before_data={"disabled": not payload.disabled}, after_data={"disabled": payload.disabled})
+
     project.preferences = preferences
-    add_activity(db, project.id, source="issue_review", section=source, action_type="issue_default_priority_changed", status="changed", title=f"Default priority changed: {definition['label']}", issue_type=issue_type, before_data={"priority": before}, after_data={"priority": payload.priority or definition["default_priority"]})
+    invalidate_project_cache(project.id)
     db.commit()
-    return {**definition, "priority": payload.priority or definition["default_priority"], "customized": payload.priority is not None}
+    custom = configured.get(key)
+    disabled = is_disabled(preferences, source, issue_type)
+    return {**definition, "priority": custom or definition["default_priority"], "customized": custom is not None, "disabled": disabled}
 
 
 @app.delete("/api/projects/{project_id}/issues/priority-settings")
@@ -242,6 +343,7 @@ def reset_issue_type_priorities(project_id: str, db: Session = Depends(get_db)):
     preferences["issue_priority_defaults"] = {}
     project.preferences = preferences
     add_activity(db, project.id, source="issue_review", section="all", action_type="issue_default_priorities_reset", status="changed", title="Issue priorities restored to defaults", before_data={"issue_priority_defaults": previous}, after_data={"issue_priority_defaults": {}})
+    invalidate_project_cache(project.id)
     db.commit()
     return {"reset": len(previous)}
 
@@ -261,6 +363,7 @@ def update_issue_priority(project_id: str, issue_key: str, payload: IssuePriorit
     before = case.priority_override
     case.priority_override = payload.priority
     add_activity(db, project.id, source="issue_review", section=issue["source"], action_type="issue_priority_changed", status="changed", title=f"Priority changed: {issue['label']}", page_id=issue.get("page_id"), url=issue.get("url"), issue_key=issue_key, issue_type=issue["type"], before_data={"priority": before}, after_data={"priority": payload.priority or "automatic"})
+    invalidate_project_cache(project.id)
     db.commit()
     return {"issue_key": issue_key, "priority": payload.priority or "automatic"}
 
@@ -582,9 +685,7 @@ def list_pages(
     allowed_sort = {"original_url", "page_type", "http_status", "indexability", "source", "last_observed_at"}
     sort_column = getattr(Page, sort if sort in allowed_sort else "last_observed_at")
     candidates = list(db.scalars(base.order_by(sort_column.asc() if direction == "asc" else sort_column.desc())))
-    candidate_ids = [item.id for item in candidates]
-    sitemap_counts = dict(db.execute(select(SitemapEntry.page_id, func.count(SitemapEntry.id)).where(SitemapEntry.project_id == project_id, SitemapEntry.page_id.in_(candidate_ids)).group_by(SitemapEntry.page_id)).all()) if candidate_ids else {}
-    link_counts = page_link_counts(db, project_id)
+    sitemap_counts = dict(db.execute(select(SitemapEntry.page_id, func.count(SitemapEntry.id)).where(SitemapEntry.project_id == project_id).group_by(SitemapEntry.page_id)).all())
     link_snapshot = latest_internal_link_snapshot(db, project_id)
     snapshots = latest_metadata(db, project.id)
     enriched = [(item, page_signals(item, snapshots.get(item.id), sitemap_counts.get(item.id, 0), project.preferences)) for item in candidates]
@@ -610,6 +711,8 @@ def list_pages(
         enriched = [(item, signals) for item, signals in enriched if sitemap_state(signals) in sitemap_states]
     total = len(enriched)
     enriched = enriched[(page - 1) * page_size:page * page_size]
+    slice_ids = [item.id for item, _ in enriched]
+    link_counts = page_link_counts(db, project_id, page_ids=slice_ids) if link_snapshot and slice_ids else {}
     payload = []
     for item, signals in enriched:
         serialized = PageOut.model_validate(item).model_dump(mode="json")
@@ -694,6 +797,7 @@ def update_page_manual_overrides(project_id: str, page_id: str, payload: PageMan
             updated.pop("_note", None)
     page.manual_overrides = updated
     add_activity(db, project.id, source="pages", section="pages", action_type="page_manual_override", status="changed", title="Page attributes manually updated", notes=payload.note, page_id=page.id, url=page.original_url, before_data=before, after_data=updated)
+    invalidate_project_cache(project.id)
     db.commit()
     sitemap_count = db.scalar(select(func.count(SitemapEntry.id)).where(SitemapEntry.project_id == project.id, SitemapEntry.page_id == page.id)) or 0
     return {"manual_overrides": updated, "effective": page_signals(page, latest_metadata(db, project.id).get(page.id), sitemap_count, project.preferences)}
@@ -724,6 +828,7 @@ def add_page(project_id: str, payload: ManualPageCreate, db: Session = Depends(g
     db.add(page)
     db.flush()
     add_activity(db, project.id, source="manual", section="keyword" if payload.page_type == PageType.DRAFT.value else "pages", action_type="page_added", status="changed", title=f"Page added: {page.original_url}", page_id=page.id, url=page.original_url, after_data={"page_type": page.page_type, "normalized_url": page.normalized_url})
+    invalidate_project_cache(project.id)
     db.commit()
     db.refresh(page)
     return page
@@ -740,6 +845,7 @@ def bulk_page_type(project_id: str, payload: BulkTypeUpdate, db: Session = Depen
         changes.append({"page_id": page.id, "url": page.original_url, "from": page.page_type, "to": payload.page_type})
         page.page_type = payload.page_type
     add_activity(db, project.id, source="pages", section="pages", action_type="page_type_changed", status="changed", title=f"Changed page type for {len(pages)} page{'s' if len(pages) != 1 else ''}", after_data={"changes": changes})
+    invalidate_project_cache(project.id)
     db.commit()
     return {"updated": len(pages)}
 

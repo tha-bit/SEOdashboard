@@ -24,6 +24,14 @@ def thresholds(project: Project) -> dict[str, int]:
     return {key: int(configured.get(key, value)) for key, value in DEFAULT_THRESHOLDS.items()}
 
 
+from .cache import (
+    get_cached_latest_metadata,
+    set_cached_latest_metadata,
+    get_cached_on_page_issues,
+    set_cached_on_page_issues,
+)
+
+
 def field_state(current: dict, field: str) -> str:
     if field not in current:
         return "not_provided"
@@ -34,6 +42,9 @@ def field_state(current: dict, field: str) -> str:
 
 
 def latest_metadata(db: Session, project_id: str) -> dict[str, dict]:
+    cached = get_cached_latest_metadata(project_id)
+    if cached is not None:
+        return cached
     observations = list(db.scalars(select(PageMetadataObservation).where(PageMetadataObservation.project_id == project_id).order_by(PageMetadataObservation.observed_at, PageMetadataObservation.id)))
     by_page: dict[str, list[PageMetadataObservation]] = defaultdict(list)
     for observation in observations:
@@ -70,6 +81,7 @@ def latest_metadata(db: Session, project_id: str) -> dict[str, dict]:
             "observation_count": len(rows),
             "last_observed_at": rows[-1].observed_at.isoformat() if rows else None,
         }
+    set_cached_latest_metadata(project_id, results)
     return results
 
 
@@ -90,12 +102,17 @@ def _issue(issue_type: str, severity: str, page: Page, label: str, detail: str, 
 
 
 def on_page_issues(db: Session, project: Project, snapshots: dict[str, dict] | None = None) -> list[dict]:
+    if snapshots is None:
+        cached = get_cached_on_page_issues(project.id)
+        if cached is not None:
+            return cached
     snapshots = snapshots or latest_metadata(db, project.id)
     pages = list(db.scalars(select(Page).where(Page.project_id == project.id)))
     pages_by_id = {page.id: page for page in pages}
     pages_by_url = {page.normalized_url: page for page in pages}
     imported_sitemap_counts = Counter(db.scalars(select(SitemapEntry.page_id).where(SitemapEntry.project_id == project.id, SitemapEntry.page_id.is_not(None))))
     imported_sitemap_ids = set(imported_sitemap_counts)
+    signals_by_page = {page.id: page_signals(page, snapshots.get(page.id), imported_sitemap_counts.get(page.id, 0), project.preferences) for page in pages}
     rules = thresholds(project)
     issues: list[dict] = []
     titles: dict[str, list[Page]] = defaultdict(list)
@@ -106,7 +123,7 @@ def on_page_issues(db: Session, project: Project, snapshots: dict[str, dict] | N
         if not snapshot:
             continue
         current = snapshot["current"]
-        signals = page_signals(page, snapshot, imported_sitemap_counts.get(page.id, 0), project.preferences)
+        signals = signals_by_page[page.id]
         if page.page_type == "Asset" or not signals["on_page_eligible"]:
             continue
         if "h1" in current:
@@ -133,7 +150,7 @@ def on_page_issues(db: Session, project: Project, snapshots: dict[str, dict] | N
                 length = _metric_or_length(current.get("meta_description_length"), description)
                 if length < rules["description_min"] or length > rules["description_max"]:
                     issues.append(_issue("description_length_guidance", "info", page, "Description outside configured guidance", f"Length is {length}; project guidance is {rules['description_min']}–{rules['description_max']} characters. This is review guidance, not a Google rule.", "meta_description"))
-        canonical = str(current.get("canonical_url") or "").strip() if "canonical_url" in current else None
+        canonical = str(signals["canonical_url"] or "").strip() if signals["canonical_url"] else None
         if canonical:
             parts = urlsplit(canonical)
             if parts.scheme not in {"http", "https"} or not parts.netloc:
@@ -149,19 +166,20 @@ def on_page_issues(db: Session, project: Project, snapshots: dict[str, dict] | N
                 if parts.netloc.lower() == site_host and not target:
                     issues.append(_issue("canonical_target_unknown", "review", page, "Canonical target is not in inventory", "The target could not be matched to a known Page record.", "canonical_url"))
                 if target:
-                    if target.http_status and target.http_status >= 300:
-                        issues.append(_issue("canonical_target_redirected", "high", page, "Canonical target redirects or errors", f"Known target status is {target.http_status}.", "canonical_url"))
-                    if target.indexability and "non" in target.indexability.lower():
-                        issues.append(_issue("canonical_target_non_indexable", "high", page, "Canonical target is non-indexable", target.indexability_status or target.indexability, "canonical_url"))
-                    if imported_sitemap_ids and target.id not in imported_sitemap_ids:
+                    target_signals = signals_by_page.get(target.id) or page_signals(target, snapshots.get(target.id), imported_sitemap_counts.get(target.id, 0), project.preferences)
+                    target_status = target_signals["http_status"]
+                    if target_status and int(target_status) >= 300:
+                        issues.append(_issue("canonical_target_redirected", "high", page, "Canonical target redirects or errors", f"Known target status is {target_status}.", "canonical_url"))
+                    if target_signals["is_non_indexable"]:
+                        issues.append(_issue("canonical_target_non_indexable", "high", page, "Canonical target is non-indexable", target_signals["indexability_status"] or target_signals["indexability"], "canonical_url"))
+                    if imported_sitemap_ids and not target_signals["sitemap_any"]:
                         issues.append(_issue("canonical_target_not_in_sitemap", "info", page, "Canonical target is absent from imported sitemap", "Imported sitemap evidence exists, but the canonical target is not listed.", "canonical_url"))
         robots = f"{current.get('meta_robots', '')},{current.get('x_robots_tag', '')}".casefold()
         noindex = bool(re.search(r"(^|[\s,])noindex($|[\s,])", robots))
-        sitemap_intent = page.sitemap_included is True or page.id in imported_sitemap_ids
-        if noindex and sitemap_intent:
+        if noindex and signals["sitemap_any"]:
             issues.append(_issue("noindex_sitemap_conflict", "high", page, "Noindex page has sitemap intent", "Robots directives contain noindex while the page is proposed or imported as a sitemap URL.", "meta_robots"))
-        if noindex and page.indexability and "non" not in page.indexability.lower():
-            issues.append(_issue("robots_indexability_conflict", "high", page, "Robots and indexability evidence conflict", f"Robots contains noindex, while imported indexability is {page.indexability}.", "meta_robots"))
+        if noindex and signals["is_indexable"]:
+            issues.append(_issue("robots_indexability_conflict", "high", page, "Robots and indexability evidence conflict", f"Robots contains noindex, while effective indexability is {signals['indexability']}.", "meta_robots"))
         if page.page_type in {"PLP", "PDP", "Editorial"}:
             missing_evidence = [name for name in ("h1", "title", "meta_description") if name not in current]
             if missing_evidence:
@@ -214,14 +232,32 @@ def on_page_issues(db: Session, project: Project, snapshots: dict[str, dict] | N
     for issue in issues:
         case = cases.get(issue["issue_key"])
         page = pages_by_id[issue["page_id"]]
-        signals = page_signals(page, snapshots.get(page.id), imported_sitemap_counts.get(page.id, 0), project.preferences)
+        signals = signals_by_page[page.id]
         issue["priority"] = resolve_priority(project.preferences, "on_page", issue["type"], computed_priority(page, issue["severity"], signals))
+        issue.update({
+            "page_type": page.page_type,
+            "content_type": signals["content_type"],
+            "http_status": signals["http_status"],
+            "http_status_text": signals["http_status_text"],
+            "indexability": signals["indexability"],
+            "indexability_status": signals["indexability_status"],
+            "canonical_url": signals["canonical_url"],
+            "canonical_status": signals["canonical_status"],
+            "redirect_uri": signals["redirect_uri"],
+            "redirect_type": signals["redirect_type"],
+            "sitemap_included": signals["sitemap_included"],
+            "in_imported_sitemap": signals["in_imported_sitemap"],
+            "imported_sitemap_occurrences": imported_sitemap_counts.get(page.id, 0),
+        })
         if case:
             issue["status"] = case.status
             issue["reason"] = case.reason
             if case.priority_override:
                 issue["priority"] = case.priority_override
-    return sorted(issues, key=lambda item: (SEVERITY_ORDER[item["severity"]], item["type"], item["url"]))
+    result = sorted(issues, key=lambda item: (SEVERITY_ORDER[item["severity"]], item["type"], item["url"]))
+    if snapshots is None:
+        set_cached_on_page_issues(project.id, result)
+    return result
 
 
 def _metric_or_length(raw, value: str) -> int:

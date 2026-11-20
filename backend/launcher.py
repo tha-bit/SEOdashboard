@@ -64,9 +64,21 @@ def _available_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
         try:
             candidate.bind((HOST, preferred))
+            return preferred
         except OSError as exc:
-            raise RuntimeError(f"Local port {preferred} is already in use") from exc
-    return preferred
+            if _request(f"http://{HOST}:{preferred}/api/health", timeout=1.0):
+                return preferred
+            if "SEO_RUNTIME_PORT" in os.environ:
+                raise RuntimeError(f"Local port {preferred} is already in use") from exc
+
+    for port in range(preferred + 1, preferred + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as candidate:
+            try:
+                candidate.bind((HOST, port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"Could not find an available local port starting from {preferred}")
 
 
 def _write_runtime(port: int, token: str) -> None:
@@ -120,7 +132,7 @@ def start(*, open_browser: bool = True) -> int:
         grace_seconds = 15.0
     server = Server(Config(
         app, host=HOST, port=port, loop="asyncio", http="h11", log_config=None, access_log=False,
-        ws_ping_interval=10, ws_ping_timeout=20, timeout_graceful_shutdown=30,
+        ws_ping_interval=None, ws_ping_timeout=None, timeout_graceful_shutdown=5,
     ))
     configure_shutdown(lambda: setattr(server, "should_exit", True), token, automatic=automatic_shutdown, grace_seconds=grace_seconds)
     _write_runtime(port, token)
@@ -131,6 +143,8 @@ def start(*, open_browser: bool = True) -> int:
         return 0
     finally:
         clear_shutdown_configuration()
+        from .services.cache import clear_all_caches
+        clear_all_caches()
         runtime = _read_runtime()
         if runtime.get("pid") == os.getpid():
             RUNTIME_FILE.unlink(missing_ok=True)

@@ -16,6 +16,7 @@ from ..schemas import OnPageBulkReviewUpdate, OnPageIssueUpdate, OnPageRecommend
 from ..services.on_page import DEFAULT_THRESHOLDS, latest_metadata, on_page_issues, recommendation_for, save_recommendation, serialize_recommendation, thresholds
 from ..services.page_signals import page_signals
 from ..services.activity import add_activity
+from ..services.cache import invalidate_project_cache
 
 router = APIRouter(prefix="/api/projects/{project_id}/on-page", tags=["on-page-seo"])
 
@@ -70,12 +71,12 @@ def _page_item(page: Page, snapshot: dict | None, recommendation: PageMetadataRe
         # value accurately. Limiting this list could hide a length or duplicate
         # warning behind unrelated higher-priority page issues.
         "notable_issues": open_issues,
-        "http_status": page.http_status,
+        "http_status": effective["http_status"],
         "content_type": effective["content_type"],
-        "indexability": page.indexability,
+        "indexability": effective["indexability"],
         "canonical_status": effective["canonical_status"],
         "redirected": effective["redirected"],
-        "sitemap_included": page.sitemap_included,
+        "sitemap_included": effective["sitemap_included"],
         "imported_sitemap_occurrences": sitemap_count,
         "architecture_parent": {"id": parent.id, "url": parent.original_url} if parent else None,
     }
@@ -220,6 +221,7 @@ def update_issue(project_id: str, issue_key: str, payload: OnPageIssueUpdate, db
         notes=case.reason, page_id=matching["page_id"], url=matching["url"], issue_key=issue_key, issue_type=matching["type"],
         before_data={"detected": True}, after_data={"review_status": payload.status}, occurred_at=case.updated_at,
     )
+    invalidate_project_cache(project.id)
     db.commit()
     return {"issue_key": issue_key, "status": case.status, "reason": case.reason}
 
@@ -236,6 +238,7 @@ def update_settings(project_id: str, payload: OnPageThresholdUpdate, db: Session
     if values["title_min"] > values["title_max"] or values["description_min"] > values["description_max"]:
         raise HTTPException(422, "Minimum guidance cannot exceed maximum guidance")
     project.preferences = {**(project.preferences or {}), "on_page_thresholds": values}
+    invalidate_project_cache(project.id)
     db.commit()
     return values
 

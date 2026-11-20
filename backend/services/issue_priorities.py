@@ -27,7 +27,7 @@ ISSUE_TYPE_DEFINITIONS = (
     _definition("site_architecture", "hierarchy_orphan", "Orphan in manually defined hierarchy", "Hierarchy", "low"),
     _definition("site_architecture", "circular_parent", "Circular primary-parent relationship", "Hierarchy", "critical"),
     _definition("site_architecture", "unknown_page_type", "Unknown page type", "Page classification", "medium"),
-    _definition("site_architecture", "sitemap_asset_or_non_html", "Asset or non-HTML resource is sitemap-listed", "Sitemap", "medium"),
+    _definition("site_architecture", "sitemap_asset_page", "Asset Pages in Sitemap", "Sitemap", "medium"),
     _definition("site_architecture", "sitemap_redirect_or_error", "Sitemap-listed page is redirected or unavailable", "Sitemap", "high"),
     _definition("site_architecture", "sitemap_non_indexable", "Sitemap-listed page is non-indexable", "Sitemap", "high"),
     _definition("site_architecture", "sitemap_eligibility_unverified", "Sitemap eligibility is unverified", "Sitemap", "low"),
@@ -48,6 +48,8 @@ ISSUE_TYPE_DEFINITIONS = (
     _definition("site_architecture", "inconsistent_anchor_text", "Highly varied anchor text", "Anchor Text Issues", "low"),
     _definition("site_architecture", "link_to_non_indexable", "Internal link targets a non-indexable page", "Indexability & Canonical Conflicts", "high"),
     _definition("site_architecture", "link_to_non_canonical", "Internal link targets a non-canonical URL", "Indexability & Canonical Conflicts", "medium"),
+    _definition("site_architecture", "link_to_3xx", "Internal link targets a redirect destination", "Indexability & Canonical Conflicts", "medium"),
+    _definition("site_architecture", "link_to_4xx", "Internal link targets an error page", "Indexability & Canonical Conflicts", "high"),
     _definition("site_architecture", "internal_link_opportunity", "Internal linking opportunity", "Internal Linking Opportunities", "low"),
     _definition("site_architecture", "template_link_concentration", "Links are concentrated in one structural position", "Link Distribution & Structural Patterns", "low"),
     _definition("site_architecture", "unusually_high_inlinks", "Unusually high internal-link volume", "Link Distribution & Structural Patterns", "low"),
@@ -80,8 +82,27 @@ def preference_key(source: str, issue_type: str) -> str:
     return f"{source}:{issue_type}"
 
 
+def disabled_key(source: str, issue_type: str) -> str:
+    return f"{source}:{issue_type}"
+
+
+def is_disabled(preferences: dict[str, Any] | None, source: str, issue_type: str) -> bool:
+    disabled_map = (preferences or {}).get("issue_disabled") or {}
+    if disabled_map.get(disabled_key(source, issue_type)):
+        return True
+    if issue_type == "sitemap_asset_page" and disabled_map.get(disabled_key(source, "sitemap_asset_or_non_html")):
+        return True
+    if issue_type == "sitemap_asset_or_non_html" and disabled_map.get(disabled_key(source, "sitemap_asset_page")):
+        return True
+    return False
+
+
 def configured_priority(preferences: dict[str, Any] | None, source: str, issue_type: str) -> str | None:
-    value = ((preferences or {}).get("issue_priority_defaults") or {}).get(preference_key(source, issue_type))
+    priority_map = (preferences or {}).get("issue_priority_defaults") or {}
+    value = priority_map.get(preference_key(source, issue_type))
+    if not value and issue_type in {"sitemap_asset_page", "sitemap_asset_or_non_html"}:
+        alt = "sitemap_asset_or_non_html" if issue_type == "sitemap_asset_page" else "sitemap_asset_page"
+        value = priority_map.get(preference_key(source, alt))
     return value if value in PRIORITY_LEVELS else None
 
 
@@ -93,5 +114,6 @@ def priority_catalog(preferences: dict[str, Any] | None) -> list[dict[str, Any]]
     rows = []
     for definition in ISSUE_TYPE_DEFINITIONS:
         custom = configured_priority(preferences, definition["source"], definition["type"])
-        rows.append({**definition, "priority": custom or definition["default_priority"], "customized": custom is not None})
+        disabled = is_disabled(preferences, definition["source"], definition["type"])
+        rows.append({**definition, "priority": custom or definition["default_priority"], "customized": custom is not None, "disabled": disabled})
     return rows

@@ -8,7 +8,7 @@ def import_csv(client, project_id, source, name, content, *, complete=False):
 
 
 def test_inlinks_import_preserves_evidence_and_drives_analysis(client, project):
-    inventory = "Address,Status Code,Status,Indexability,Content Type,Page Type,Crawl Depth,Inlinks\nhttps://shop.example.com/,200,OK,Indexable,text/html,Homepage,0,12\nhttps://shop.example.com/products,200,OK,Indexable,text/html,PLP,2,4\nhttps://shop.example.com/missing,404,Not Found,Non-Indexable,text/html,Other,1,1\nhttps://shop.example.com/redirect,301,Moved Permanently,Non-Indexable,text/html,Other,1,0\nhttps://shop.example.com/uncollected,200,OK,Indexable,text/html,Other,,\n"
+    inventory = "Address,Status Code,Status,Indexability,Content Type,Page Type,Crawl Depth,Inlinks\nhttps://shop.example.com/,200,OK,Indexable,text/html,PDP,0,12\nhttps://shop.example.com/products,200,OK,Indexable,text/html,PLP,2,4\nhttps://shop.example.com/missing,404,Not Found,Non-Indexable,text/html,PDP,1,1\nhttps://shop.example.com/redirect,301,Moved Permanently,Non-Indexable,text/html,PDP,1,0\nhttps://shop.example.com/uncollected,200,OK,Indexable,text/html,PDP,,\n"
     import_csv(client, project["id"], "screaming_frog", "crawl.csv", inventory)
     inlinks = "Type,Source,Destination,Anchor,Status Code,Status,Follow,Rel,Link Position,Link Origin\nHyperlink,https://shop.example.com/,https://shop.example.com/products,Products,200,OK,true,,Content,HTML\nHyperlink,https://shop.example.com/,https://shop.example.com/missing,click here,404,Not Found,true,,Content,HTML\nHyperlink,https://shop.example.com/,https://outside.example.org/,External,200,OK,true,,Footer,HTML\n"
     result = import_csv(client, project["id"], "screaming_frog_inlinks", "inlinks.csv", inlinks, complete=True)
@@ -23,12 +23,13 @@ def test_inlinks_import_preserves_evidence_and_drives_analysis(client, project):
 
     findings = client.get(f"/api/projects/{project['id']}/architecture/internal-links/findings").json()["items"]
     broken = next(item for item in findings if item["type"] == "broken_internal_link" and item["evidence"]["destination_url"].endswith("/missing"))
-    assert broken["inlinks"] == 0
-    assert broken["imported_inlinks"] == 12
-    assert broken["internal_inlinks"] == 12
+    assert broken["inlinks"] == 1
+    assert broken["imported_inlinks"] == 1
+    assert broken["internal_inlinks"] == 1
     assert broken["internal_inlinks_source"] == "screaming_frog"
-    assert broken["crawl_depth"] == 0
-    assert broken["page_status_code"] == 200
+    assert broken["crawl_depth"] == 1
+    assert broken["page_status_code"] == 404
+    assert broken["affected_link_count"] == 1
     weak_product = next(item for item in findings if item["type"] == "weakly_linked_page" and item["url"].endswith("/products"))
     assert weak_product["inlinks"] == 1
     assert weak_product["unique_sources"] == 1
